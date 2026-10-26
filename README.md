@@ -14,7 +14,17 @@
 | 查UDP协议、Boot差异及源码行号 | [协议核对](docs/PROTOCOL.md) |
 | 区分离线检查与实体设备验收 | [验证记录](docs/VERIFICATION.md) |
 
-Windows成品直接双击 `NewCardDemo.exe`，需要 .NET Framework 4.8。源码构建需要 .NET 8 SDK：
+**Windows 一键启动：完整解压后，双击根目录的 `启动Demo.cmd`。** 成品包直接打开离线控制台；源码包自动运行检查、增量构建，再打开程序。路径包含中文或空格也可使用，无需先切换命令行目录。
+
+成品运行需要 .NET Framework 4.8，源码构建还需要 .NET 8 SDK。缺少依赖、构建失败或同路径程序仍在运行时，会停止并显示原因，不自动安装依赖或关闭已有程序。
+
+只构建、不打开日常窗口：
+
+```bat
+启动Demo.cmd -BuildOnly
+```
+
+需要手动构建时也可以使用：
 
 ```powershell
 .\scripts\build-windows.ps1
@@ -47,6 +57,7 @@ src/NewCard.Core/       回显协议、单次UDP客户端、四轴离线模型
 tests/                 手工协议向量、异常包、模拟与回环恢复检查（net8）
 scripts/               Windows构建与只读资料清单工具
 docs/                  资料索引、协议、运行说明和验证记录
+启动Demo.cmd           Windows一键构建/启动入口
 ```
 
 本仓库与旧 `robotic-arm` 工程分开维护，不改变旧控制台或其开放PR。原厂资料中的“开源”称谓不等于已核实许可证；本次只根据接口事实新增实现与索引，不重新分发原厂内容。
