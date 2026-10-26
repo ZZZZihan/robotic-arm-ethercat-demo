@@ -33,6 +33,10 @@
 
 需要 .NET 8 SDK（构建工具）；生成程序运行目标为 .NET Framework 4.8。项目用微软的参考程序集包进行编译，依据 [Microsoft Reference Assemblies](https://learn.microsoft.com/en-us/dotnet/framework/migration-guide/reference-assemblies)。
 
+1. 首次使用先安装 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)，并确认电脑已安装 [.NET Framework 4.8](https://dotnet.microsoft.com/en-us/download/dotnet-framework/net48)。SDK 与程序运行环境是两个依赖。
+2. 在仓库 `main` 分支点击 **Code → Download ZIP**，或[直接下载源码包](https://github.com/ZZZZihan/robotic-arm-ethercat-demo/archive/refs/heads/main.zip)，完整解压到普通本地文件夹。无需 Git。
+3. 打开解压后的源码根目录，双击 `启动Demo.cmd`。首次构建需要联网下载微软参考程序集包；检查通过后自动打开离线窗口。
+
 **解压完整源码包，双击 `启动Demo.cmd` 即可构建并启动。** 源码模式每次先做检查和增量构建，避免打开与当前代码不一致的旧程序；若同一路径的程序正在运行，请先正常关闭它。构建失败不会继续启动旧成品。
 
 可选命令：

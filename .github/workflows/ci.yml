@@ -18,9 +18,20 @@ jobs:
       - name: Build and verify offline Windows console
         shell: pwsh
         run: ./scripts/build-windows.ps1
-      - name: Check source and packaged one-click launchers offline
+      - name: Check downloaded ZIP and packaged one-click launchers offline
         shell: pwsh
-        run: ./tests/LauncherChecks.ps1
+        env:
+          ARCHIVE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ARCHIVE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'downloaded-source.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'GitHub ZIP source'
+          Invoke-WebRequest -Uri "https://codeload.github.com/$env:ARCHIVE_REPOSITORY/zip/$env:ARCHIVE_SHA" -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $sourceRoots = @(Get-ChildItem -LiteralPath $destination -Directory)
+          if ($sourceRoots.Count -ne 1) { throw 'Expected one source root in the GitHub ZIP.' }
+          Write-Host "Testing GitHub source ZIP at $env:ARCHIVE_SHA"
+          & (Join-Path $sourceRoots[0].FullName 'tests/LauncherChecks.ps1') -ArtifactDirectory (Join-Path $env:GITHUB_WORKSPACE '.artifacts/windows-demo')
       - uses: actions/upload-artifact@v4
         if: always()
         with:

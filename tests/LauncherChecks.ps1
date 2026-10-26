@@ -9,7 +9,7 @@ $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powersh
 $wrapperName = '启动Demo.cmd'
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('启动器 检查 中文 ' + [Guid]::NewGuid().ToString('N'))
 $script:caseCount = 0
-$interactiveExecutablePath = $null
+$script:interactiveExecutablePaths = @()
 
 function Assert-Condition([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -69,6 +69,29 @@ function Get-OwnedDemoProcesses([string]$ExecutablePath) {
     }
 }
 
+function Check-InteractiveLaunch([string]$Name, [string]$Directory, [string]$ExecutablePath) {
+    # Open the normal offline window through the same no-argument entry used by double-click.
+    # Do not redirect this invocation: a GUI child may inherit redirected pipe handles.
+    $script:interactiveExecutablePaths += $ExecutablePath
+    $normalLaunch = Invoke-Launcher $Directory @() -ViaCommandFile -NoOutputCapture
+    Assert-Condition ($normalLaunch.ExitCode -eq 0) ($Name + '：无参数启动失败。')
+    $windowTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        $windowProcesses = @(Get-OwnedDemoProcesses $ExecutablePath)
+        Assert-Condition ($windowProcesses.Count -le 1) ($Name + '：隔离目录启动了多个 Demo 进程。')
+        if ($windowProcesses.Count -eq 1 -and $windowProcesses[0].MainWindowHandle -ne [IntPtr]::Zero) { break }
+        Start-Sleep -Milliseconds 200
+    } while ($windowTimer.ElapsedMilliseconds -lt 20000)
+    Assert-Condition ($windowProcesses.Count -eq 1) ($Name + '：没有启动隔离目录内的 Demo。')
+    $windowProcess = $windowProcesses[0]
+    Assert-Condition ($windowProcess.MainWindowTitle -eq '新卡四轴 Demo · 离线演示与回显诊断') ($Name + '：主窗体标题不符：' + $windowProcess.MainWindowTitle)
+    Assert-Condition ($windowProcess.CloseMainWindow()) ($Name + '：无法请求关闭本次检查启动的 Demo 窗口。')
+    Assert-Condition ($windowProcess.WaitForExit(10000)) ($Name + '：本次检查启动的 Demo 窗口未正常退出。')
+    $windowProcess.Dispose()
+    $script:caseCount++
+    Write-Host ('PASS: ' + $Name + '无参数打开并正常关闭离线主窗体')
+}
+
 function Check-Result([string]$Name, $Result, [int]$ExpectedExitCode, [switch]$OfflineSmoke) {
     Assert-Condition ($Result.ExitCode -eq $ExpectedExitCode) ($Name + '：预期退出码 ' + $ExpectedExitCode + '，实际 ' + $Result.ExitCode)
     if ($OfflineSmoke) {
@@ -112,31 +135,14 @@ try {
     Check-Result '成品 VerifyOnly 真实离线界面' (Invoke-Launcher $packageDirectory @('-VerifyOnly')) 0 -OfflineSmoke
     Check-Result '成品一键入口 VerifyOnly 真实离线界面' (Invoke-Launcher $packageDirectory @('-VerifyOnly') -ViaCommandFile) 0 -OfflineSmoke
 
-    # Open the normal offline window through the same no-argument entry used by double-click.
-    # Do not redirect this invocation: a GUI child may inherit redirected pipe handles.
-    $interactiveExecutablePath = Join-Path $packageDirectory 'NewCardDemo.exe'
-    $normalLaunch = Invoke-Launcher $packageDirectory @() -ViaCommandFile -NoOutputCapture
-    Assert-Condition ($normalLaunch.ExitCode -eq 0) '成品一键入口无参数启动失败。'
-    $windowTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    do {
-        $windowProcesses = @(Get-OwnedDemoProcesses $interactiveExecutablePath)
-        Assert-Condition ($windowProcesses.Count -le 1) '隔离成品目录启动了多个 Demo 进程。'
-        if ($windowProcesses.Count -eq 1 -and $windowProcesses[0].MainWindowHandle -ne [IntPtr]::Zero) { break }
-        Start-Sleep -Milliseconds 200
-    } while ($windowTimer.ElapsedMilliseconds -lt 20000)
-    Assert-Condition ($windowProcesses.Count -eq 1) '成品一键入口没有启动隔离目录内的 Demo。'
-    $windowProcess = $windowProcesses[0]
-    Assert-Condition ($windowProcess.MainWindowTitle -eq '新卡四轴 Demo · 离线演示与回显诊断') ('成品主窗体标题不符：' + $windowProcess.MainWindowTitle)
-    Assert-Condition ($windowProcess.CloseMainWindow()) '无法请求关闭本次检查启动的 Demo 窗口。'
-    Assert-Condition ($windowProcess.WaitForExit(10000)) '本次检查启动的 Demo 窗口未正常退出。'
-    $script:caseCount++
-    Write-Host 'PASS: 成品一键入口无参数打开并正常关闭离线主窗体'
+    Check-InteractiveLaunch '成品一键入口' $packageDirectory (Join-Path $packageDirectory 'NewCardDemo.exe')
 
     $sourceDirectory = Join-Path $temporaryRoot '源码 有空格'
     Copy-SourceFixture $sourceDirectory
     Check-Result '源码 BuildOnly' (Invoke-Launcher $sourceDirectory @('-BuildOnly')) 0
     Assert-Condition (Test-Path -LiteralPath (Join-Path $sourceDirectory '.artifacts\windows-demo\NewCardDemo.exe') -PathType Leaf) '源码 BuildOnly 未产生预期成品。'
     Check-Result '源码 VerifyOnly 真实离线界面' (Invoke-Launcher $sourceDirectory @('-VerifyOnly')) 0 -OfflineSmoke
+    Check-InteractiveLaunch '源码一键入口' $sourceDirectory (Join-Path $sourceDirectory '.artifacts\windows-demo\NewCardDemo.exe')
 
     $missingExecutableDirectory = Join-Path $temporaryRoot '缺少 成品'
     Copy-Item -LiteralPath $ArtifactDirectory -Destination $missingExecutableDirectory -Recurse
@@ -174,7 +180,7 @@ try {
 
     Write-Host ('PASS: ' + $script:caseCount + ' launcher checks; paths include spaces and Chinese; verification uses offline mode only.')
 } finally {
-    if ($interactiveExecutablePath) {
+    foreach ($interactiveExecutablePath in $script:interactiveExecutablePaths) {
         foreach ($ownedProcess in @(Get-OwnedDemoProcesses $interactiveExecutablePath)) {
             $ownedProcess.CloseMainWindow() | Out-Null
             if (-not $ownedProcess.WaitForExit(5000)) { $ownedProcess.Kill() }
