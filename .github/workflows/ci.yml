@@ -1,7 +1,7 @@
 name: Offline verification
 on:
   push:
-    branches: [main, 'feature/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -29,6 +29,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
