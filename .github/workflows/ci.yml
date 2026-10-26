@@ -1,0 +1,54 @@
+name: Offline verification
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build and verify offline Windows console
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Check downloaded ZIP and packaged one-click launchers offline
+        shell: pwsh
+        env:
+          ARCHIVE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ARCHIVE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'downloaded-source.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'GitHub ZIP source'
+          Invoke-WebRequest -Uri "https://codeload.github.com/$env:ARCHIVE_REPOSITORY/zip/$env:ARCHIVE_SHA" -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $sourceRoots = @(Get-ChildItem -LiteralPath $destination -Directory)
+          if ($sourceRoots.Count -ne 1) { throw 'Expected one source root in the GitHub ZIP.' }
+          Write-Host "Testing GitHub source ZIP at $env:ARCHIVE_SHA"
+          & (Join-Path $sourceRoots[0].FullName 'tests/LauncherChecks.ps1') -ArtifactDirectory (Join-Path $env:GITHUB_WORKSPACE '.artifacts/windows-demo')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-demo
+          path: .artifacts/windows-demo/
+          if-no-files-found: error
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Protocol, synthetic motion and loopback transport
+        run: dotnet run --project tests/NewCard.Tests.csproj -c Release
+      - name: Check tracked whitespace
+        run: git diff --check HEAD~1 HEAD
