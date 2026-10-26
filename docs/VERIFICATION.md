@@ -12,7 +12,11 @@
 
 ## Windows集成验证
 
-由当前PR的 `Offline verification` 工作流执行。Windows任务编译Windows .exe，再以 `--ui-smoke-test` 实际打开窗体，执行15项离线界面检查并保存 `offline-ui.png`。Linux任务独立执行相同核心检查。最终运行链接、结果与产物哈希将在完成后补充。
+由 [PR #1 检查页](https://github.com/ZZZZihan/robotic-arm-ethercat-demo/pull/1/checks) 的 `Offline verification` 工作流执行。Windows任务编译Windows .exe，再以 `--ui-smoke-test` 实际打开窗体；Linux任务独立执行相同核心检查。
+
+已完成的 [基线运行 c6aaf26](https://github.com/ZZZZihan/robotic-arm-ethercat-demo/actions/runs/40276329760) 中，Windows和Linux均通过75项核心检查，Windows通过15项离线界面检查。首次CI只检出一层历史，导致代码格式检查无法找到父提交；补足检出深度后该步骤已通过。
+
+基线截图的反馈注释被较矮窗口裁切。当前版本已压缩布局、为注释单独保留空间并增加可见性断言；最新Windows检查共17项，另外保存 `hardware-ui.png` 供视觉复核。交付包的 `交付清单.json` 记录实际下载的CI运行、源码提交和文件SHA-256；各运行的成品与截图保存在工作流 `windows-demo` 产物中。当前提交是否通过，以PR检查页和对应产物为准。
 
 界面检查覆盖默认离线、四轴显示、输入锁定、模拟移动与停止、轴独立性，以及全过程未调用回显。它不自动执行实体网络诊断。核心回环测试使用127.0.0.1上的合成回复，不代表与实卡通信成功。
 

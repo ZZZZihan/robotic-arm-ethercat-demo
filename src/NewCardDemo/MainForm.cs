@@ -42,6 +42,7 @@ namespace NewCardDemo
         private readonly Button echo = new Button();
         private readonly Label echoState = new Label();
         private readonly TextBox echoDetails = new TextBox();
+        private readonly TabControl tabs = new TabControl();
         private readonly EchoClient echoClient = new EchoClient();
         private readonly List<Control> endpointControls = new List<Control>();
         private CancellationTokenSource echoCancellation;
@@ -56,8 +57,8 @@ namespace NewCardDemo
             Font = new Font("Microsoft YaHei UI", 10F);
             ForeColor = Ink;
             BackColor = Surface;
-            ClientSize = new Size(1160, 820);
-            MinimumSize = new Size(1060, 800);
+            ClientSize = new Size(1000, 700);
+            MinimumSize = new Size(960, 700);
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.Dpi;
 
@@ -129,10 +130,10 @@ namespace NewCardDemo
         {
             TableLayoutPanel root = Grid(1, 4);
             root.Padding = new Padding(24, 14, 24, 14);
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 68));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 142));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 116));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
             Controls.Add(root);
 
             TableLayoutPanel header = Grid(2, 2);
@@ -153,9 +154,10 @@ namespace NewCardDemo
             header.SetColumnSpan(subtitle, 2);
             root.Controls.Add(header, 0, 0);
 
-            TabControl tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(18, 9) };
-            TabPage offline = new TabPage("四轴离线演示") { BackColor = Color.White, Padding = new Padding(18) };
-            TabPage hardware = new TabPage("硬件回显诊断") { BackColor = Color.White, Padding = new Padding(22) };
+            tabs.Dock = DockStyle.Fill;
+            tabs.Padding = new Point(18, 9);
+            TabPage offline = new TabPage("四轴离线演示") { BackColor = Color.White, Padding = new Padding(14), AutoScroll = true };
+            TabPage hardware = new TabPage("硬件回显诊断") { BackColor = Color.White, Padding = new Padding(18), AutoScroll = true };
             tabs.TabPages.Add(offline);
             tabs.TabPages.Add(hardware);
             BuildOfflinePage(offline);
@@ -185,10 +187,12 @@ namespace NewCardDemo
         private void BuildOfflinePage(TabPage page)
         {
             TableLayoutPanel layout = Grid(1, 5);
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+            layout.Dock = DockStyle.Top;
+            layout.Height = 388;
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             page.Controls.Add(layout);
 
@@ -214,7 +218,7 @@ namespace NewCardDemo
             inputs.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             inputs.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             inputs.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-            inputs.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            inputs.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
             inputs.Controls.Add(LabelText("相对位移 / 演示计数", 10, true), 0, 0);
             inputs.Controls.Add(LabelText("速度 / 演示计数每秒", 10, true), 1, 0);
             ConfigureNumber(amount, 1, 1000, 100);
@@ -246,9 +250,9 @@ namespace NewCardDemo
             feedback.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
             feedback.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
             feedback.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-            feedback.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
-            feedback.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-            feedback.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            feedback.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+            feedback.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+            feedback.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             feedback.Controls.Add(LabelText("模拟位置", 10, false), 0, 0);
             feedback.Controls.Add(LabelText("模拟目标", 10, false), 1, 0);
             feedback.Controls.Add(LabelText("模拟状态", 10, false), 2, 0);
@@ -262,6 +266,8 @@ namespace NewCardDemo
                 feedback.Controls.Add(values[index], index, 1);
             }
             axisNote.Dock = DockStyle.Fill;
+            axisNote.Margin = new Padding(0);
+            axisNote.MinimumSize = new Size(0, 48);
             axisNote.ForeColor = Muted;
             axisNote.TextAlign = ContentAlignment.MiddleLeft;
             feedback.Controls.Add(axisNote, 0, 2);
@@ -272,11 +278,12 @@ namespace NewCardDemo
         private void BuildHardwarePage(TabPage page)
         {
             TableLayoutPanel layout = Grid(1, 6);
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 120));
+            layout.MinimumSize = new Size(0, 380);
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 112));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             page.Controls.Add(layout);
             layout.Controls.Add(LabelText("只发送 0x01 回显", 17, true), 0, 0);
@@ -514,22 +521,45 @@ namespace NewCardDemo
             SelectAxis(1);
             amount.Value = 100;
             speed.Value = 50;
-            AddLog("离线界面检查通过：" + checks + " 项；未打开控制卡、未发送 UDP。");
             RefreshSimulation();
+            PerformLayout();
+            Update();
+            TabPage offlinePage = tabs.TabPages[0];
+            Rectangle noteBounds = offlinePage.RectangleToClient(axisNote.RectangleToScreen(axisNote.ClientRectangle));
+            check(axisNote.Visible && axisNote.Height >= 48 && noteBounds.Top >= offlinePage.Padding.Top
+                && noteBounds.Bottom <= offlinePage.ClientSize.Height - offlinePage.Padding.Bottom,
+                "轴映射与模拟单位注释完整处于当前页面视口内");
+            tabs.SelectedIndex = 1;
+            tabs.SelectedTab.PerformLayout();
+            Update();
+            check(echoState.Text == "尚未通信" && echoProbeCount == 0 && echoCancellation == null,
+                "切换硬件诊断页面不触发通信");
+            tabs.SelectedIndex = 0;
+            AddLog("离线界面检查通过：" + checks + " 项；未打开控制卡、未发送 UDP。");
             Update();
             if (!String.IsNullOrWhiteSpace(screenshotPath))
             {
                 string fullPath = Path.GetFullPath(screenshotPath);
                 string directory = Path.GetDirectoryName(fullPath);
                 if (!String.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-                using (Bitmap bitmap = new Bitmap(Width, Height))
-                {
-                    DrawToBitmap(bitmap, new Rectangle(0, 0, Width, Height));
-                    bitmap.Save(fullPath, ImageFormat.Png);
-                }
+                SaveUiScreenshot(fullPath);
+                tabs.SelectedIndex = 1;
+                tabs.SelectedTab.PerformLayout();
+                Update();
+                SaveUiScreenshot(Path.Combine(directory, "hardware-ui.png"));
+                tabs.SelectedIndex = 0;
             }
             report = "PASS: " + checks + " offline UI checks; 0 echo probes; no hardware operations.";
             return true;
+        }
+
+        private void SaveUiScreenshot(string path)
+        {
+            using (Bitmap bitmap = new Bitmap(Width, Height))
+            {
+                DrawToBitmap(bitmap, new Rectangle(0, 0, Width, Height));
+                bitmap.Save(path, ImageFormat.Png);
+            }
         }
 
         protected override void Dispose(bool disposing)

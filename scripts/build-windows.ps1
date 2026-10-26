@@ -14,5 +14,8 @@ Get-Content (Join-Path $OutputDirectory 'ui-check.txt')
 if ($process.ExitCode -ne 0) { Get-Content (Join-Path $OutputDirectory 'ui-error.txt'); throw 'Windows 离线界面检查失败。' }
 Copy-Item (Join-Path $root 'README.md') $OutputDirectory
 Copy-Item (Join-Path $root 'docs\WINDOWS_QUICKSTART.md') $OutputDirectory
+$outputDocs = Join-Path $OutputDirectory 'docs'
+New-Item -ItemType Directory -Path $outputDocs -Force | Out-Null
+Copy-Item (Join-Path $root 'docs\*') $outputDocs -Recurse -Force
 Get-FileHash $exe -Algorithm SHA256 | Format-List
 Write-Host "构建与离线检查完成：$OutputDirectory"
