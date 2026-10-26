@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.artifacts/
+.tools/
+.vs/
+*.user
+*.suo
+*.zip
+*.rar
+*.7z
+.DS_Store
