@@ -21,5 +21,13 @@ Copy-Item (Join-Path $PSScriptRoot 'start-demo.ps1') $launcherScripts
 $outputDocs = Join-Path $OutputDirectory 'docs'
 New-Item -ItemType Directory -Path $outputDocs -Force | Out-Null
 Copy-Item (Join-Path $root 'docs\*') $outputDocs -Recurse -Force
-Get-FileHash $exe -Algorithm SHA256 | Format-List
+$hashAlgorithm = [System.Security.Cryptography.SHA256]::Create()
+$exeStream = [System.IO.File]::OpenRead($exe)
+try {
+    $exeHash = [System.BitConverter]::ToString($hashAlgorithm.ComputeHash($exeStream)).Replace('-', '').ToLowerInvariant()
+} finally {
+    $exeStream.Dispose()
+    $hashAlgorithm.Dispose()
+}
+Write-Host ("SHA256: {0}  {1}" -f $exeHash, $exe)
 Write-Host "构建与离线检查完成：$OutputDirectory"
