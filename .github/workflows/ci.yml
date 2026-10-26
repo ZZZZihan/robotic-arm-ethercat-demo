@@ -1,0 +1,38 @@
+name: Offline verification
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build and verify offline Windows console
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-demo
+          path: .artifacts/windows-demo/
+          if-no-files-found: error
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Protocol, synthetic motion and loopback transport
+        run: dotnet run --project tests/NewCard.Tests.csproj -c Release
+      - name: Check tracked whitespace
+        run: git diff --check HEAD~1 HEAD
