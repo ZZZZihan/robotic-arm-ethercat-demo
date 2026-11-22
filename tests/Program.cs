@@ -20,9 +20,11 @@ namespace NewCard.Tests
             try
             {
                 int protocol = ProtocolTests.Run();
+                int sc4i = Sc4iTests.Run();
+                int scara = ScaraKinematicsTests.Run();
                 ModelTests();
                 TransportTests().GetAwaiter().GetResult();
-                Console.WriteLine("PASS: protocol=" + protocol + ", model/transport=" + count + "; synthetic data and loopback only.");
+                Console.WriteLine("PASS: protocol=" + protocol + ", sc4i=" + sc4i + ", scara=" + scara + ", model/transport=" + count + "; synthetic data and loopback only.");
                 return 0;
             }
             catch (Exception error) { Console.Error.WriteLine(error); return 1; }

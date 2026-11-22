@@ -3,6 +3,8 @@
 .artifacts/
 .tools/
 .vs/
+data/
+scara-calibration.ini
 *.user
 *.suo
 *.zip

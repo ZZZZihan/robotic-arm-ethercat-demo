@@ -84,7 +84,7 @@ function Check-InteractiveLaunch([string]$Name, [string]$Directory, [string]$Exe
     } while ($windowTimer.ElapsedMilliseconds -lt 20000)
     Assert-Condition ($windowProcesses.Count -eq 1) ($Name + '：没有启动隔离目录内的 Demo。')
     $windowProcess = $windowProcesses[0]
-    Assert-Condition ($windowProcess.MainWindowTitle -eq '新卡四轴 Demo · 离线演示与回显诊断') ($Name + '：主窗体标题不符：' + $windowProcess.MainWindowTitle)
+    Assert-Condition ($windowProcess.MainWindowTitle -eq '四轴机械臂控制') ($Name + '：主窗体标题不符：' + $windowProcess.MainWindowTitle)
     Assert-Condition ($windowProcess.CloseMainWindow()) ($Name + '：无法请求关闭本次检查启动的 Demo 窗口。')
     Assert-Condition ($windowProcess.WaitForExit(10000)) ($Name + '：本次检查启动的 Demo 窗口未正常退出。')
     $windowProcess.Dispose()
