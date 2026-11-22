@@ -4,11 +4,13 @@
     <OutputType>WinExe</OutputType>
     <AssemblyName>ScaraArm.Console</AssemblyName>
     <RootNamespace>ScaraArm.Console</RootNamespace>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <EmbeddedResource Include="Assets\app.ico" LogicalName="ScaraArm.Console.app.ico" />
     <ProjectReference Include="..\ScaraArm.Core\ScaraArm.Core.csproj" />
   </ItemGroup>
 </Project>

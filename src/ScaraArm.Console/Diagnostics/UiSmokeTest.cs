@@ -22,6 +22,7 @@ namespace ScaraArm.Console.Diagnostics
 
             check(!form.IsHardwareConnected, "启动不自动连接实机");
             check(form.Text == MainForm.WindowTitle, "窗体标题简洁一致");
+            check(form.Icon != null, "已加载自定义应用图标");
             check(form.ConnectButtonEnabled && form.SettingsButtonEnabled, "离线时仅允许连接与设置");
             check(!form.JointPanel.EnableButtonEnabled
                 && !form.JointPanel.MoveButtonsEnabled

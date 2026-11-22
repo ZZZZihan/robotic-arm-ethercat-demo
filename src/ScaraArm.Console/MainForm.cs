@@ -24,6 +24,7 @@ namespace ScaraArm.Console
         private const double DefaultAccelerationRevPerSec2 = 1.0;
 
         private readonly UiTheme theme = new UiTheme();
+        private readonly Icon appIcon;
         private readonly Sc4iClient sc4iClient = new Sc4iClient();
         private readonly System.Windows.Forms.Timer pollTimer;
         private readonly System.Windows.Forms.Timer jogTimer;
@@ -84,6 +85,8 @@ namespace ScaraArm.Console
         internal MainForm()
         {
             Text = WindowTitle;
+            appIcon = LoadAppIcon();
+            if (appIcon != null) Icon = appIcon;
             Font = theme.Regular;
             ForeColor = UiTheme.Ink;
             BackColor = UiTheme.Bg;
@@ -647,6 +650,27 @@ namespace ScaraArm.Console
             statusLabel.ForeColor = color;
         }
 
+        private static Icon LoadAppIcon()
+        {
+            try
+            {
+                using (Stream stream = typeof(MainForm).Assembly.GetManifestResourceStream("ScaraArm.Console.app.ico"))
+                {
+                    if (stream != null) return new Icon(stream);
+                }
+            }
+            catch { }
+
+            try
+            {
+                return Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -655,6 +679,7 @@ namespace ScaraArm.Console
                 if (pollTimer != null) pollTimer.Dispose();
                 if (jogTimer != null) jogTimer.Dispose();
                 sc4iClient.Dispose();
+                if (appIcon != null) appIcon.Dispose();
                 theme.Dispose();
             }
             base.Dispose(disposing);
