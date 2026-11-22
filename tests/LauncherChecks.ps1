@@ -3,10 +3,10 @@
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw '启动器检查需要在 Windows 上运行。' }
 $root = Split-Path -Parent $PSScriptRoot
-if (-not $ArtifactDirectory) { $ArtifactDirectory = Join-Path $root '.artifacts\windows-demo' }
+if (-not $ArtifactDirectory) { $ArtifactDirectory = Join-Path $root '.artifacts\windows-console' }
 $ArtifactDirectory = [System.IO.Path]::GetFullPath($ArtifactDirectory)
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$wrapperName = '启动Demo.cmd'
+$wrapperName = '启动控制台.cmd'
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('启动器 检查 中文 ' + [Guid]::NewGuid().ToString('N'))
 $script:caseCount = 0
 $script:interactiveExecutablePaths = @()
@@ -30,7 +30,7 @@ function Invoke-Launcher([string]$Directory, [string[]]$Arguments, [switch]$ViaC
         $processInfo.Arguments = '/d /s /c ""' + $wrapperPath + '" ' + $quotedArguments + '"'
     } else {
         $processInfo.FileName = $powershell
-        $launcherPath = Join-Path $Directory 'scripts\start-demo.ps1'
+        $launcherPath = Join-Path $Directory 'scripts\start-console.ps1'
         $processInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $launcherPath + '" ' + $quotedArguments
     }
     $process = New-Object System.Diagnostics.Process
@@ -59,8 +59,8 @@ function Invoke-Launcher([string]$Directory, [string[]]$Arguments, [switch]$ViaC
     }
 }
 
-function Get-OwnedDemoProcesses([string]$ExecutablePath) {
-    foreach ($candidate in @(Get-Process -Name NewCardDemo -ErrorAction SilentlyContinue)) {
+function Get-OwnedConsoleProcesses([string]$ExecutablePath) {
+    foreach ($candidate in @(Get-Process -Name 'ScaraArm.Console' -ErrorAction SilentlyContinue)) {
         try {
             if ($candidate.Path -eq $ExecutablePath) { $candidate }
         } catch {
@@ -77,16 +77,16 @@ function Check-InteractiveLaunch([string]$Name, [string]$Directory, [string]$Exe
     Assert-Condition ($normalLaunch.ExitCode -eq 0) ($Name + '：无参数启动失败。')
     $windowTimer = [System.Diagnostics.Stopwatch]::StartNew()
     do {
-        $windowProcesses = @(Get-OwnedDemoProcesses $ExecutablePath)
-        Assert-Condition ($windowProcesses.Count -le 1) ($Name + '：隔离目录启动了多个 Demo 进程。')
+        $windowProcesses = @(Get-OwnedConsoleProcesses $ExecutablePath)
+        Assert-Condition ($windowProcesses.Count -le 1) ($Name + '：隔离目录启动了多个控制台进程。')
         if ($windowProcesses.Count -eq 1 -and $windowProcesses[0].MainWindowHandle -ne [IntPtr]::Zero) { break }
         Start-Sleep -Milliseconds 200
     } while ($windowTimer.ElapsedMilliseconds -lt 20000)
-    Assert-Condition ($windowProcesses.Count -eq 1) ($Name + '：没有启动隔离目录内的 Demo。')
+    Assert-Condition ($windowProcesses.Count -eq 1) ($Name + '：没有启动隔离目录内的控制台。')
     $windowProcess = $windowProcesses[0]
     Assert-Condition ($windowProcess.MainWindowTitle -eq '四轴机械臂控制') ($Name + '：主窗体标题不符：' + $windowProcess.MainWindowTitle)
-    Assert-Condition ($windowProcess.CloseMainWindow()) ($Name + '：无法请求关闭本次检查启动的 Demo 窗口。')
-    Assert-Condition ($windowProcess.WaitForExit(10000)) ($Name + '：本次检查启动的 Demo 窗口未正常退出。')
+    Assert-Condition ($windowProcess.CloseMainWindow()) ($Name + '：无法请求关闭本次检查启动的控制台窗口。')
+    Assert-Condition ($windowProcess.WaitForExit(10000)) ($Name + '：本次检查启动的控制台窗口未正常退出。')
     $windowProcess.Dispose()
     $script:caseCount++
     Write-Host ('PASS: ' + $Name + '无参数打开并正常关闭离线主窗体')
@@ -95,7 +95,7 @@ function Check-InteractiveLaunch([string]$Name, [string]$Directory, [string]$Exe
 function Check-Result([string]$Name, $Result, [int]$ExpectedExitCode, [switch]$OfflineSmoke) {
     Assert-Condition ($Result.ExitCode -eq $ExpectedExitCode) ($Name + '：预期退出码 ' + $ExpectedExitCode + '，实际 ' + $Result.ExitCode)
     if ($OfflineSmoke) {
-        Assert-Condition ($Result.Output -match 'PASS: \d+ offline UI checks; 0 echo probes; no hardware operations\.') ($Name + '：缺少真实离线界面检查通过记录。')
+        Assert-Condition ($Result.Output -match 'PASS: \d+ offline UI checks; no hardware operations\.') ($Name + '：缺少真实离线界面检查通过记录。')
     }
     $script:caseCount++
     Write-Host ('PASS: ' + $Name)
@@ -119,13 +119,15 @@ function Copy-SourceFixture([string]$Destination) {
                 Copy-Item -LiteralPath $_.FullName -Destination $targetPath
             }
     }
-    Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $Destination
-    Copy-Item -LiteralPath (Join-Path $root $wrapperName) -Destination $Destination
+    foreach ($rootFile in @('Directory.Build.props', 'ScaraArm.sln', 'README.md', $wrapperName)) {
+        Copy-Item -LiteralPath (Join-Path $root $rootFile) -Destination $Destination
+    }
 }
 
 try {
-    Assert-Condition (Test-Path -LiteralPath (Join-Path $ArtifactDirectory 'NewCardDemo.exe') -PathType Leaf) '请先运行 scripts/build-windows.ps1 生成真实 Windows 成品。'
-    Assert-Condition (Test-Path -LiteralPath (Join-Path $ArtifactDirectory 'scripts\start-demo.ps1') -PathType Leaf) '成品缺少 scripts/start-demo.ps1。'
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $ArtifactDirectory 'ScaraArm.Console.exe') -PathType Leaf) '请先运行 scripts/build-windows.ps1 生成真实 Windows 成品。'
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $ArtifactDirectory 'ScaraArm.Core.dll') -PathType Leaf) '成品缺少 ScaraArm.Core.dll。'
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $ArtifactDirectory 'scripts\start-console.ps1') -PathType Leaf) '成品缺少 scripts/start-console.ps1。'
     Assert-Condition (Test-Path -LiteralPath (Join-Path $ArtifactDirectory $wrapperName) -PathType Leaf) '成品缺少一键启动文件。'
     New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 
@@ -135,34 +137,34 @@ try {
     Check-Result '成品 VerifyOnly 真实离线界面' (Invoke-Launcher $packageDirectory @('-VerifyOnly')) 0 -OfflineSmoke
     Check-Result '成品一键入口 VerifyOnly 真实离线界面' (Invoke-Launcher $packageDirectory @('-VerifyOnly') -ViaCommandFile) 0 -OfflineSmoke
 
-    Check-InteractiveLaunch '成品一键入口' $packageDirectory (Join-Path $packageDirectory 'NewCardDemo.exe')
+    Check-InteractiveLaunch '成品一键入口' $packageDirectory (Join-Path $packageDirectory 'ScaraArm.Console.exe')
 
     $sourceDirectory = Join-Path $temporaryRoot '源码 有空格'
     Copy-SourceFixture $sourceDirectory
     Check-Result '源码 BuildOnly' (Invoke-Launcher $sourceDirectory @('-BuildOnly')) 0
-    Assert-Condition (Test-Path -LiteralPath (Join-Path $sourceDirectory '.artifacts\windows-demo\NewCardDemo.exe') -PathType Leaf) '源码 BuildOnly 未产生预期成品。'
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $sourceDirectory '.artifacts\windows-console\ScaraArm.Console.exe') -PathType Leaf) '源码 BuildOnly 未产生预期成品。'
     Check-Result '源码 VerifyOnly 真实离线界面' (Invoke-Launcher $sourceDirectory @('-VerifyOnly')) 0 -OfflineSmoke
-    Check-InteractiveLaunch '源码一键入口' $sourceDirectory (Join-Path $sourceDirectory '.artifacts\windows-demo\NewCardDemo.exe')
+    Check-InteractiveLaunch '源码一键入口' $sourceDirectory (Join-Path $sourceDirectory '.artifacts\windows-console\ScaraArm.Console.exe')
 
     $missingExecutableDirectory = Join-Path $temporaryRoot '缺少 成品'
     Copy-Item -LiteralPath $ArtifactDirectory -Destination $missingExecutableDirectory -Recurse
-    Remove-Item -LiteralPath (Join-Path $missingExecutableDirectory 'NewCardDemo.exe')
+    Remove-Item -LiteralPath (Join-Path $missingExecutableDirectory 'ScaraArm.Console.exe')
     Check-Failure '成品缺少 exe' (Invoke-Launcher $missingExecutableDirectory @('-VerifyOnly'))
 
     $missingProjectDirectory = Join-Path $temporaryRoot '缺少 源码项目'
     New-Item -ItemType Directory -Path (Join-Path $missingProjectDirectory 'scripts') -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $missingProjectDirectory 'src\NewCardDemo') -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $root 'scripts\start-demo.ps1') -Destination (Join-Path $missingProjectDirectory 'scripts')
+    New-Item -ItemType Directory -Path (Join-Path $missingProjectDirectory 'src\ScaraArm.Console') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'scripts\start-console.ps1') -Destination (Join-Path $missingProjectDirectory 'scripts')
     Copy-Item -LiteralPath (Join-Path $root $wrapperName) -Destination $missingProjectDirectory
     Check-Failure '源码缺少项目' (Invoke-Launcher $missingProjectDirectory @('-BuildOnly') -ViaCommandFile)
 
     $invalidProjectDirectory = Join-Path $temporaryRoot '无效 源码项目'
     Copy-SourceFixture $invalidProjectDirectory
-    [System.IO.File]::WriteAllText((Join-Path $invalidProjectDirectory 'src\NewCardDemo\NewCardDemo.csproj'), '<Project>')
+    [System.IO.File]::WriteAllText((Join-Path $invalidProjectDirectory 'src\ScaraArm.Console\ScaraArm.Console.csproj'), '<Project>')
     Check-Failure '源码构建失败' (Invoke-Launcher $invalidProjectDirectory @('-BuildOnly'))
-    Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $invalidProjectDirectory '.artifacts\windows-demo\NewCardDemo.exe'))) '失败的源码构建留下了可误启动的成品。'
+    Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $invalidProjectDirectory '.artifacts\windows-console\ScaraArm.Console.exe'))) '失败的源码构建留下了可误启动的成品。'
 
-    # This fixture checks exit propagation only; real UI checks above always use the built demo.
+    # This fixture checks exit propagation only; real UI checks above always use the built console.
     $compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
     if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
         $compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
@@ -172,7 +174,7 @@ try {
     Copy-Item -LiteralPath $ArtifactDirectory -Destination $exitFixtureDirectory -Recurse
     $exitFixtureSource = Join-Path $temporaryRoot 'ExitFixture.cs'
     [System.IO.File]::WriteAllText($exitFixtureSource, 'internal static class ExitFixture { private static int Main(string[] args) { return args.Length == 1 && args[0] == "--ui-smoke-test" ? 37 : 91; } }')
-    & $compiler /nologo /target:exe ('/out:' + (Join-Path $exitFixtureDirectory 'NewCardDemo.exe')) $exitFixtureSource
+    & $compiler /nologo /target:exe ('/out:' + (Join-Path $exitFixtureDirectory 'ScaraArm.Console.exe')) $exitFixtureSource
     Assert-Condition ($LASTEXITCODE -eq 0) '退出码检查用的临时程序编译失败。'
     Check-Result '成品 BuildOnly 不运行程序' (Invoke-Launcher $exitFixtureDirectory @('-BuildOnly')) 0
     Check-Result 'VerifyOnly 传播程序退出码' (Invoke-Launcher $exitFixtureDirectory @('-VerifyOnly')) 37
@@ -181,7 +183,7 @@ try {
     Write-Host ('PASS: ' + $script:caseCount + ' launcher checks; paths include spaces and Chinese; verification uses offline mode only.')
 } finally {
     foreach ($interactiveExecutablePath in $script:interactiveExecutablePaths) {
-        foreach ($ownedProcess in @(Get-OwnedDemoProcesses $interactiveExecutablePath)) {
+        foreach ($ownedProcess in @(Get-OwnedConsoleProcesses $interactiveExecutablePath)) {
             $ownedProcess.CloseMainWindow() | Out-Null
             if (-not $ownedProcess.WaitForExit(5000)) { $ownedProcess.Kill() }
             $ownedProcess.Dispose()

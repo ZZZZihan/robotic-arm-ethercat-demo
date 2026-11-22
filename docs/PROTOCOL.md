@@ -1,8 +1,8 @@
 # 新运动卡协议与源码核对
 
-本次 Demo 只发送 `0x01 / 0x00` 的 100 字节通信查询。它不发送状态轮询、运动、回零、使能、输出、电机参数、重启或升级命令。正常 App 回复必须通过固定长度、校验、命令、令牌和完整 72 字节回显关联后，才显示通信成功。
+> **v0.1.0 说明**：当前 `ScaraArm.Core` 与 `ScaraArm.Console` 完整实现的是下文 [实板 SC4I0001 v2 协议与现场适配](#实板-sc4i0001-v2-协议与现场适配2026-11-21)（`0x01` Hello + `0xF2` 会话/总线/单轴运动与遥测），代码位于 `src/ScaraArm.Core/Protocol/` 与 `src/ScaraArm.Core/Transport/`。早期对原厂归档的静态核对记录保留在下方，便于对比参考。
 
-核对日期：2026-10-26。结论来自归档中的 C 固件、C# Demo 和协议表的静态读取；没有运行厂商程序，没有连接运动卡，没有进行硬件动作。用户实际烧录版本仍需现场确认。
+核对日期：2026-10-26（原厂归档静态核对） / 2026-11-21（实板 `SC4I0001 v2` 现场取证与协议实现）。
 
 ## 实际读取的归档与定位方式
 
@@ -128,7 +128,7 @@ EchoReply CardProtocol.ParseEchoReply(byte[] packet, byte token, byte[] challeng
 
 ## 离线验证范围
 
-`tests/ProtocolTests.cs` 使用手工给定的请求/回复向量验证长度和大小端、累加校验、完整挑战回显、令牌边界和错包拒绝；真实 Boot 的全零回显区与伪造 Boot 回显都必须被拒绝。`tests/Sc4iTests.cs` 使用合成向量和 `127.0.0.1` UDP 回环测试覆盖下述 `SC4I0001 v2` 编解码、528 字节配置、384 字节遥测及安全联锁。
+`tests/Sc4iProtocolTests.cs`、`tests/Sc4iClientTests.cs`、`tests/ScaraKinematicsTests.cs` 与 `tests/CartesianMotionPlannerTests.cs` 使用合成向量与 `127.0.0.1` UDP 回环测试覆盖 `SC4I0001 v2` 编解码、528 字节配置、384 字节遥测、安全联锁、正逆运动学与笛卡尔安全运动顺序。
 
 ## 实板 SC4I0001 v2 协议与现场适配（2026-11-21）
 

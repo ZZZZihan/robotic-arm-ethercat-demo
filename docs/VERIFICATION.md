@@ -63,3 +63,15 @@
 - **实机联动与现场抗干扰排查记录**：
   - 完成四轴全使能（`en=0xF, auth=0xF`）下 `+Z / −X / +Y` 实机笛卡尔移动验证（`+Z` 实测编码器反馈 `+20.04 mm`，全程 `pdoAge=0 ms, lat=0x00, drvErr=0x0000`）。
   - 现场定位并记录了一起典型强电 EMI 问题：伺服使能时若上位机网线紧贴橙色电机动力线，会同时引发 PC↔W5500 丢包（界面闪烁“通信超时/已就绪”）与驱动器 `Er.E08` 同步丢失；将网线与动力线物理隔离并断电清 `Er.E08` 后恢复 0% 丢包。
+
+## v0.1.0 架构重构与离线验证（2026-11-22）
+
+- **死代码清理**：移除已不再使用的旧版 `OfflineArmModel`、`EchoClient`、`CardProtocol` 及对应旧测试。
+- **高内聚低耦合分层**：
+  - 统一项目命名为 `ScaraArm.Core`（`net48;net8.0` 独立类库）、`ScaraArm.Console`（`net48` WinForms）、`ScaraArm.Tests`（`net8.0` 测试），新增 `ScaraArm.sln` 与 `Directory.Build.props`（版本号 `0.1.0`）。
+  - `ScaraArm.Core` 按单向依赖划分为 `Protocol`、`Transport`、`Kinematics`、`Motion` 四层，新增 `UdpFrameChannel` 与可离线单测的 `CartesianMotionPlanner` / `ISc4iMotionClient`，合并 `Sc4iClient` 中重复的运动前安全联锁。
+  - `ScaraArm.Console` 将原 2,081 行 `MainForm.cs` 拆分为 `Theme/UiTheme`、`Controls/`（`AxisCard`、`JointControlPanel`、`CartesianControlPanel`）、`Dialogs/`（网络设置、设零点、标定参数）、`Diagnostics/UiSmokeTest`，并将主窗体按界面渲染（`MainForm.cs`）与硬件会话操作（`MainForm.Operations.cs`）分离。
+- **本机验证（macOS）**：
+  - `dotnet build ScaraArm.sln -c Release` 全量构建通过（`ScaraArm.Core` net48 + net8.0、`ScaraArm.Console` net48、`ScaraArm.Tests` net8.0），0 警告、0 错误。
+  - `dotnet run --project tests/ScaraArm.Tests.csproj -c Release` 共 **134 项离线断言全部通过**（`protocol=35, client=28, scara=49, planner=22`），新增覆盖笛卡尔“上升先提 Z / 下降后降 Z”顺序、未使能拦截及急停中途终止。
+  - Windows 实机 `--ui-smoke-test` 与 `tests/LauncherChecks.ps1` 需在 Windows 环境或 GitHub Actions `windows` 任务中执行验证。

@@ -31,12 +31,12 @@ jobs:
           $sourceRoots = @(Get-ChildItem -LiteralPath $destination -Directory)
           if ($sourceRoots.Count -ne 1) { throw 'Expected one source root in the GitHub ZIP.' }
           Write-Host "Testing GitHub source ZIP at $env:ARCHIVE_SHA"
-          & (Join-Path $sourceRoots[0].FullName 'tests/LauncherChecks.ps1') -ArtifactDirectory (Join-Path $env:GITHUB_WORKSPACE '.artifacts/windows-demo')
+          & (Join-Path $sourceRoots[0].FullName 'tests/LauncherChecks.ps1') -ArtifactDirectory (Join-Path $env:GITHUB_WORKSPACE '.artifacts/windows-console')
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-demo
-          path: .artifacts/windows-demo/
+          name: windows-console
+          path: .artifacts/windows-console/
           if-no-files-found: error
   core:
     runs-on: ubuntu-latest
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Protocol, synthetic motion and loopback transport
-        run: dotnet run --project tests/NewCard.Tests.csproj -c Release
+      - name: Protocol, kinematics, motion planner and loopback transport
+        run: dotnet run --project tests/ScaraArm.Tests.csproj -c Release
       - name: Check tracked whitespace
         run: git diff --check HEAD~1 HEAD

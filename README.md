@@ -1,65 +1,92 @@
-# 新 EtherCAT 卡 · 四轴机械臂控制台
+# 四轴 SCARA 机械臂控制台（v0.1.0）
 
-为四轴立柱升降式 SCARA 机械臂更换新运动卡准备的独立 Windows 控制台（`SC4I0001 v2` + 4×汇川 SV630N），支持**关节单轴低速调试**与**四轴 SCARA 笛卡尔坐标系 `(X, Y, Z, R)` 控制**。
+面向四轴立柱升降式 SCARA 机械臂（HC32F4A0 `SC4I0001 v2` 运动卡 + 4×汇川 SV630N 伺服驱动器）的独立 Windows 控制台与核心控制库，支持**关节单轴低速调试**与**四轴 SCARA 笛卡尔坐标系 `(X, Y, Z, R)` 安全联动控制**。
 
-这张卡的主机接口是 UDP（`192.168.8.12:6000 ↔ 192.168.8.20:5000`），不能使用旧博派 `GA_*` SDK。程序启动默认离线，不自动连接控制卡；用户显式点击“连接”后完成握手与只读进 OP（电机不上使能），急停与停止均保持伺服持力（`0x605A=6` 仅写 RAM，不写驱动 EEPROM）。
+## 核心特性（v0.1.0）
 
-## 入口
+- **默认安全离线**：启动时不自动连接控制卡、不初始化总线、不上电机使能；用户显式点击“连接”后完成握手与只读进 OP（电机保持未使能），急停与停止均保持伺服持力（`0x605A=6` 仅写 RAM，不写驱动 EEPROM）。
+- **关节单轴调试**：选轴、单轴使能/重新授权、低速小步长相对定位、按住点动与保活监督、两步清故障/解锁。
+- **四轴 SCARA 笛卡尔控制**：实时正运动学 `(X, Y, Z, R)` 与手系显示、逆运动学求解、工作空间与四轴软限位预检、安全运动顺序（**上升先提 Z、下降后降 Z**）、一键设零点与 `scara-calibration.ini` 持久化。
+- **分层解耦架构**：核心协议、UDP 会话通信、运动学与标定、笛卡尔运动编排全部沉淀在零 UI 依赖的 `ScaraArm.Core` 类库中，可跨平台离线单测。
 
-| 目的 | 文件 |
-| --- | --- |
-| 直接在Windows运行、构建、诊断 | [Windows使用说明](docs/WINDOWS_QUICKSTART.md) |
-| 快速找到教程、硬件和各结构固件 | [资料基本索引](docs/MATERIALS.md) |
-| 查看12个原件的指纹与嵌套ZIP成员 | [资料清单](docs/materials/manifest.json) |
-| 查UDP协议、Boot差异及源码行号 | [协议核对](docs/PROTOCOL.md) |
-| 区分离线检查与实体设备验收 | [验证记录](docs/VERIFICATION.md) |
+## 架构分层
 
-**Windows 一键启动：完整解压后，双击根目录的 `启动Demo.cmd`。** 成品包直接打开离线控制台；源码包自动运行检查、增量构建，再打开程序。路径包含中文或空格也可使用，无需先切换命令行目录。
+依赖方向严格单向无环：
 
-从本仓库获取源码：选择 `main` 分支，点击 **Code → Download ZIP**，完整解压后使用上述入口；不需要安装 Git。也可[直接下载 main 源码包](https://github.com/ZZZZihan/robotic-arm-ethercat-demo/archive/refs/heads/main.zip)。
-
-成品运行需要 .NET Framework 4.8，源码构建还需要 .NET 8 SDK；首次构建需要联网还原微软的参考程序集包。缺少依赖、构建失败或同路径程序仍在运行时，会停止并显示原因，不自动安装依赖或关闭已有程序。
-
-只构建、不打开日常窗口：
-
-```bat
-启动Demo.cmd -BuildOnly
+```text
+ScaraArm.Console (WinForms UI, net48)
+        │
+        ▼
+ScaraArm.Core.Motion      ── 笛卡尔安全规划与逐步到位编排（依赖接口，可离线单测）
+    ├──▶ ScaraArm.Core.Kinematics  ── SCARA 标定参数、INI 持久化与正/逆运动学
+    └──▶ ScaraArm.Core.Transport   ── UDP 通道、重试与 SC4I 会话/安全联锁客户端
+            │
+            ▼
+         ScaraArm.Core.Protocol    ── SC4I0001 v2 帧编解码、528B 配置与错误码表
 ```
 
-需要手动构建时也可以使用：
+## 项目结构
+
+```text
+ScaraArm.sln                        解决方案入口
+Directory.Build.props               统一版本号 (0.1.0) 与编译选项
+启动控制台.cmd                       Windows 一键构建 / 启动入口
+src/
+  ScaraArm.Core/                    核心控制库（net48;net8.0，零 UI 依赖）
+    Protocol/                       0x01 / 0xF2 协议编解码、遥测模型、528B 配置
+    Transport/                      UDP 通道、SC4I 会话客户端与运动前安全联锁
+    Kinematics/                     SCARA 标定、INI 读写与正/逆运动学
+    Motion/                         笛卡尔安全序列规划与执行器
+  ScaraArm.Console/                 Windows 控制台界面（net48 WinForms）
+    Theme/                          配色、字体与布局样式工具
+    Controls/                       AxisCard、关节面板、笛卡尔面板
+    Dialogs/                        网络设置、设零点、标定参数弹窗
+    Diagnostics/                    离线 UI 冒烟检查 (--ui-smoke-test)
+    MainForm.cs                     主窗体布局、弹窗入口与状态绑定
+    MainForm.Operations.cs          会话生命周期、心跳轮询、点动与急停操作
+tests/                              离线单元测试与 Windows 启动器校验（net8.0）
+scripts/                            Windows 构建、一键启动与资料索引脚本
+docs/                               使用说明、协议核对、验证记录与硬件资料索引
+```
+
+## 快速开始
+
+### Windows 一键运行 / 构建
+
+完整解压源码包或成品包后，直接双击根目录的 **`启动控制台.cmd`**（支持含中文或空格路径）：
+- 成品包：检查 `.NET Framework 4.8` 后直接启动控制台；
+- 源码包：自动运行核心测试、增量构建并完成离线 UI 冒烟检查，再打开控制台。
+
+仅构建不启动日常窗口：
+
+```bat
+启动控制台.cmd -BuildOnly
+```
+
+或使用 PowerShell 手动构建与打包到 `.artifacts\windows-console\`：
 
 ```powershell
 .\scripts\build-windows.ps1
 ```
 
-脚本运行核心检查、编译控制台并进行短暂的离线界面检查；不连接实体卡。GitHub Actions也生成 `windows-demo` 构建产物。使用源码自行检查核心行为时，可在Windows/macOS/Linux运行：
+### 运行核心单元测试（Windows / macOS / Linux）
 
 ```sh
-dotnet run --project tests/NewCard.Tests.csproj -c Release
+dotnet run --project tests/ScaraArm.Tests.csproj -c Release
 ```
 
-## 本版范围
+## 文档导航
 
-- 四个独立模拟轴：选轴、相对正/反向定位、模拟反馈、停止保持当前位置、操作记录。
-- 输入与模拟行程检查，运行中禁止切轴和重复启动。所有数据使用演示计数，不表示实体位置或机械安全行程。
-- 显式的一次UDP探测：地址/端口、帧长、校验和、命令、令牌、完整挑战数据都符合才报告App回显通过；无自动重试和后台轮询。
-- 全部原件保留，重复PDF与汇川归档仅标记、不删除；原厂源码、DLL、安装包和压缩资料不上传仓库。
+| 目的 | 文件 |
+| --- | --- |
+| Windows 运行、源码构建与实机操作指南 | [Windows 使用说明](docs/WINDOWS_QUICKSTART.md) |
+| `SC4I0001 v2` UDP 协议与原厂固件核对 | [协议核对](docs/PROTOCOL.md) |
+| 离线单测、CI 与现场实机验收记录 | [验证记录](docs/VERIFICATION.md) |
+| 原厂硬件/教程资料目录索引（参考） | [资料基本索引](docs/MATERIALS.md) |
+| 原厂 12 份归档文件指纹清单（参考） | [资料清单](docs/materials/manifest.json) |
 
-## 进入真实运动前
+## 安全提示
 
-用户已确认目标还是同一台四轴机械臂，但新卡当前固件、四个实体关节映射、驱动型号、方向、零位、脉冲当量、减速比、行程及磁吸接口仍未知。四轴龙门和SCARA示例都不能自动视为适配版本。
-
-尤其要注意：资料中的App会自行进行EtherCAT初始化，某些版本还会写驱动参数。我们的demo不发运动指令不能保证现有板卡固件没有其他行为。现场的上电、使能、低速运动、回零和参数写入需要在硬件条件核对后另行安排。
-
-## 项目结构
-
-```text
-src/NewCardDemo/        原生WinForms界面（net48）
-src/NewCard.Core/       回显协议、单次UDP客户端、四轴离线模型
-tests/                 手工协议向量、异常包、模拟与回环恢复检查（net8）
-scripts/               Windows构建与只读资料清单工具
-docs/                  资料索引、协议、运行说明和验证记录
-启动Demo.cmd           Windows一键构建/启动入口
-```
-
-本仓库与旧 `robotic-arm` 工程分开维护，不改变旧控制台或其开放PR。原厂资料中的“开源”称谓不等于已核实许可证；本次只根据接口事实新增实现与索引，不重新分发原厂内容。
+- 主机接口为普通以太网 UDP（默认 `192.168.8.12:6000 ↔ 192.168.8.20:5000`），与旧博派 `GA_*` SDK 不通用。
+- 请保持电脑网线、EtherCAT 网线与伺服三相动力线物理分开（建议 ≥20 cm），避免强电干扰引发丢包或驱动器 `Er.E08` 同步丢失。
+- 仓库不分发原厂闭源源码、DLL、安装包或压缩资料；所有控制代码与协议编解码均为独立实现。

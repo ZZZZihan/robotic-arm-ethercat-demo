@@ -1,33 +1,19 @@
 using System;
 using System.Diagnostics;
 using System.Globalization;
-using System.Net;
-using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using ScaraArm.Core.Protocol;
 
-namespace NewCard.Core
+namespace ScaraArm.Core.Transport
 {
-    public sealed class Sc4iCommandException : InvalidOperationException
-    {
-        public uint ErrorCode { get; private set; }
-        public Sc4iStatusReply Status { get; private set; }
-
-        public Sc4iCommandException(string action, Sc4iStatusReply status)
-            : base(action + " 失败：" + Sc4iProtocol.FormatErrorCode(status.ErrorCode))
-        {
-            ErrorCode = status.ErrorCode;
-            Status = status;
-        }
-    }
-
     /// <summary>
     /// Explicit, serialized UDP session client for SC4I0001 v2 firmware.
     /// All blocking UDP I/O runs on thread-pool threads so UI and E-Stop stay responsive.
     /// Never connects, initializes EtherCAT, enables servos, or commands motion automatically.
     /// </summary>
-    public sealed class Sc4iClient : IDisposable
+    public sealed class Sc4iClient : ISc4iMotionClient, IDisposable
     {
         public const double MaxSafeStepRev = 20.0;
         public const double MaxSafeVelocityRevPerSec = 2.5;
@@ -35,13 +21,10 @@ namespace NewCard.Core
         public const double MaxSafeAccelerationRevPerSec2 = 8.0;
         public const uint MaxFreshPdoAgeMs = 500u;
 
-        private const int SioUdpConnReset = -1744830452;
-
         private readonly SemaphoreSlim gate = new SemaphoreSlim(1, 1);
         private readonly object stateLock = new object();
         private readonly CancellationTokenSource disposeCts = new CancellationTokenSource();
-        private Socket socket;
-        private IPEndPoint remoteEndPoint;
+        private UdpFrameChannel channel;
         private CancellationTokenSource sessionCts;
         private int defaultTimeoutMs = 2000;
         private bool connected;
@@ -55,46 +38,22 @@ namespace NewCard.Core
 
         public bool IsConnected
         {
-            get
-            {
-                lock (stateLock)
-                {
-                    return connected && !disposed;
-                }
-            }
+            get { lock (stateLock) { return connected && !disposed; } }
         }
 
         public ulong BootId
         {
-            get
-            {
-                lock (stateLock)
-                {
-                    return bootId;
-                }
-            }
+            get { lock (stateLock) { return bootId; } }
         }
 
         public ulong SessionId
         {
-            get
-            {
-                lock (stateLock)
-                {
-                    return sessionId;
-                }
-            }
+            get { lock (stateLock) { return sessionId; } }
         }
 
         public Sc4iStatusReply LastStatus
         {
-            get
-            {
-                lock (stateLock)
-                {
-                    return lastStatus;
-                }
-            }
+            get { lock (stateLock) { return lastStatus; } }
         }
 
         public double CountsPerRevolution { get { return Sc4iMachineConfig.DefaultCountsPerRevolution; } }
@@ -102,8 +61,9 @@ namespace NewCard.Core
         public Task<Sc4iStatusReply> ConnectAsync(
             string localIp, int localPort, string cardIp, int cardPort, int timeoutMs, CancellationToken cancellationToken)
         {
-            IPAddress local = ParseUnicast(localIp, "电脑 IP");
-            IPAddress remote = ParseUnicast(cardIp, "控制卡 IP");
+            // Eagerly validate inputs on caller thread before scheduling async work.
+            UdpFrameChannel.ParseUnicast(localIp, "电脑 IP");
+            UdpFrameChannel.ParseUnicast(cardIp, "控制卡 IP");
             if (localPort < 0 || localPort > 65535) throw new ArgumentOutOfRangeException("localPort");
             if (cardPort < 1 || cardPort > 65535) throw new ArgumentOutOfRangeException("cardPort");
             if (timeoutMs < 200 || timeoutMs > 15000) throw new ArgumentOutOfRangeException("timeoutMs");
@@ -117,67 +77,26 @@ namespace NewCard.Core
                     try
                     {
                         ThrowIfDisposed();
-                        CloseSocketInternal();
+                        CloseChannelInternal();
 
-                        Socket candidate = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                        UdpFrameChannel candidate = UdpFrameChannel.Open(localIp, localPort, cardIp, cardPort);
                         try
                         {
-                            ConfigureUdpSocket(candidate);
-                            candidate.Bind(new IPEndPoint(local, localPort));
-                            IPEndPoint target = new IPEndPoint(remote, cardPort);
-
                             helloToken = (byte)((helloToken + 1) % 240);
                             if (helloToken == 0) helloToken = 1;
                             byte expectedToken = helloToken;
                             byte[] helloReq = Sc4iProtocol.BuildHelloRequest(expectedToken);
-                            Sc4iHelloReply hello = ExchangeValidatedWithRetry(
-                                candidate, target, helloReq, Sc4iProtocol.HelloReplyLength, timeoutMs, 250, 4, ct,
+                            Sc4iHelloReply hello = candidate.ExchangeValidatedWithRetry(
+                                helloReq, Sc4iProtocol.HelloReplyLength, timeoutMs, 250, 4, ct,
                                 raw => Sc4iProtocol.ParseHelloReply(raw, expectedToken));
 
                             // Pure read-only snapshot first to inspect existing bus & session state.
-                            Sc4iStatusReply snap = SendF2InternalWithRetry(
-                                candidate, target, Sc4iSubcmd.Snapshot, 0, 0, hello.BootId, 0, null, timeoutMs, 200, 4, ct);
+                            Sc4iStatusReply snap = SendF2OnChannelWithRetry(
+                                candidate, Sc4iSubcmd.Snapshot, 0, 0, hello.BootId, 0, null, timeoutMs, 200, 4, ct);
 
-                            ulong newSid = GenerateSessionId();
-                            uint startSeq = 1;
-                            Sc4iStatusReply acquired = SendF2Internal(
-                                candidate, target, Sc4iSubcmd.AcquireSession, 0, startSeq, hello.BootId, newSid, null, timeoutMs, ct);
-
-                            if (acquired.ErrorCode == 0x36)
-                            {
-                                if (snap.BusReady && snap.AuthorizedMask == 0 && snap.MotionState == 0)
-                                {
-                                    // Firmware allows clean session takeover once prior heartbeat expires (> 1000 ms).
-                                    await Task.Delay(1150, ct).ConfigureAwait(false);
-                                    newSid = GenerateSessionId();
-                                    startSeq = 1;
-                                    acquired = SendF2Internal(
-                                        candidate, target, Sc4iSubcmd.AcquireSession, 0, startSeq, hello.BootId, newSid, null, timeoutMs, ct);
-                                }
-                                if (acquired.ErrorCode == 0x36 && snap.SessionId != 0)
-                                {
-                                    // Same host/port reconnect before bus init (or while holding session): resume active session with strictly monotonic seq.
-                                    newSid = snap.SessionId;
-                                    startSeq = ComputeRecoverySeq(snap.Seq, maxUsedSeq);
-                                    acquired = SendF2Internal(
-                                        candidate, target, Sc4iSubcmd.AcquireSession, 0, startSeq, hello.BootId, newSid, null, timeoutMs, ct);
-                                    uint[] replaySteps = new uint[] { 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u };
-                                    for (int attempt = 0; acquired.ErrorCode == 0x35 && attempt < replaySteps.Length; attempt++)
-                                    {
-                                        ulong bumped = acquired.Seq > startSeq
-                                            ? (ulong)acquired.Seq + 1UL
-                                            : (ulong)startSeq + replaySteps[attempt];
-                                        if (bumped > uint.MaxValue - 1000u)
-                                            bumped = uint.MaxValue - 1000u;
-                                        if (bumped <= startSeq)
-                                            break;
-                                        startSeq = (uint)bumped;
-                                        acquired = SendF2Internal(
-                                            candidate, target, Sc4iSubcmd.AcquireSession, 0, startSeq, hello.BootId, newSid, null, timeoutMs, ct);
-                                    }
-                                }
-                            }
-
+                            SessionLease lease = await AcquireOrRecoverSessionAsync(
+                                candidate, hello.BootId, snap, timeoutMs, ct).ConfigureAwait(false);
+                            Sc4iStatusReply acquired = lease.Reply;
                             if (acquired.ErrorCode != 0)
                                 throw new Sc4iCommandException("获取控制卡会话租约", acquired);
 
@@ -189,14 +108,13 @@ namespace NewCard.Core
                                     newSessionCts.Dispose();
                                     throw new ObjectDisposedException("Sc4iClient");
                                 }
-                                socket = candidate;
-                                remoteEndPoint = target;
+                                channel = candidate;
                                 sessionCts = newSessionCts;
                                 defaultTimeoutMs = timeoutMs;
                                 bootId = hello.BootId;
-                                sessionId = newSid;
-                                if (startSeq > maxUsedSeq) maxUsedSeq = startSeq;
-                                nextSeq = startSeq + 1u;
+                                sessionId = lease.SessionId;
+                                if (lease.StartSeq > maxUsedSeq) maxUsedSeq = lease.StartSeq;
+                                nextSeq = lease.StartSeq + 1u;
                                 if (nextSeq == 0) nextSeq = 1u;
                                 lastStatus = acquired;
                                 connected = true;
@@ -217,6 +135,66 @@ namespace NewCard.Core
             });
         }
 
+        private struct SessionLease
+        {
+            public Sc4iStatusReply Reply;
+            public ulong SessionId;
+            public uint StartSeq;
+        }
+
+        private async Task<SessionLease> AcquireOrRecoverSessionAsync(
+            UdpFrameChannel candidate, ulong cardBootId, Sc4iStatusReply snap, int timeoutMs, CancellationToken ct)
+        {
+            ulong newSid = GenerateSessionId();
+            uint startSeq = 1;
+            Sc4iStatusReply acquired = SendF2OnChannel(
+                candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+
+            if (acquired.ErrorCode == 0x36)
+            {
+                if (snap.BusReady && snap.AuthorizedMask == 0 && snap.MotionState == 0)
+                {
+                    // Firmware allows clean session takeover once prior heartbeat expires (> 1000 ms).
+                    await Task.Delay(1150, ct).ConfigureAwait(false);
+                    newSid = GenerateSessionId();
+                    startSeq = 1;
+                    acquired = SendF2OnChannel(
+                        candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+                }
+
+                if (acquired.ErrorCode == 0x36 && snap.SessionId != 0)
+                {
+                    // Same host/port reconnect before bus init (or while holding session): resume active session with strictly monotonic seq.
+                    newSid = snap.SessionId;
+                    startSeq = ComputeRecoverySeq(snap.Seq, maxUsedSeq);
+                    acquired = SendF2OnChannel(
+                        candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+
+                    uint[] replaySteps = { 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u };
+                    for (int attempt = 0; acquired.ErrorCode == 0x35 && attempt < replaySteps.Length; attempt++)
+                    {
+                        ulong bumped = acquired.Seq > startSeq
+                            ? (ulong)acquired.Seq + 1UL
+                            : (ulong)startSeq + replaySteps[attempt];
+                        if (bumped > uint.MaxValue - 1000u)
+                            bumped = uint.MaxValue - 1000u;
+                        if (bumped <= startSeq)
+                            break;
+                        startSeq = (uint)bumped;
+                        acquired = SendF2OnChannel(
+                            candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+                    }
+                }
+            }
+
+            return new SessionLease
+            {
+                Reply = acquired,
+                SessionId = newSid,
+                StartSeq = startSeq
+            };
+        }
+
         public void Disconnect()
         {
             CancelSessionInternal();
@@ -229,7 +207,7 @@ namespace NewCard.Core
                 }
                 gate.Wait();
                 acquired = true;
-                CloseSocketInternal();
+                CloseChannelInternal();
             }
             catch (ObjectDisposedException)
             {
@@ -254,12 +232,12 @@ namespace NewCard.Core
         {
             return RunConnectedAsync(cancellationToken, ct =>
             {
-                Sc4iStatusReply cur = SendNextF2("查询状态", Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
+                Sc4iStatusReply cur = SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
                 if (cur.ErrorCode != 0)
                     throw new Sc4iCommandException("查询状态", cur);
                 if (cur.BusReady)
                     return Task.FromResult(cur);
-                Sc4iStatusReply scanned = SendNextF2("扫描 EtherCAT 从站 (PRE-OP)", Sc4iSubcmd.ScanSlaves, 0, null, 15000, ct);
+                Sc4iStatusReply scanned = SendNextF2(Sc4iSubcmd.ScanSlaves, 0, null, 15000, ct);
                 if (scanned.ErrorCode != 0)
                     throw new Sc4iCommandException("扫描 EtherCAT 从站 (PRE-OP)", scanned);
                 return Task.FromResult(scanned);
@@ -270,7 +248,7 @@ namespace NewCard.Core
         {
             return RunConnectedAsync(cancellationToken, async ct =>
             {
-                Sc4iStatusReply cur = SendNextF2("查询状态", Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
+                Sc4iStatusReply cur = SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
                 if (cur.ErrorCode != 0)
                     throw new Sc4iCommandException("查询状态", cur);
                 if (cur.BusReady)
@@ -278,7 +256,7 @@ namespace NewCard.Core
 
                 if (cur.SlaveCount != 4 || !HasFourPopulatedIdentities(cur))
                 {
-                    cur = SendNextF2("扫描 EtherCAT 从站 (PRE-OP)", Sc4iSubcmd.ScanSlaves, 0, null, 15000, ct);
+                    cur = SendNextF2(Sc4iSubcmd.ScanSlaves, 0, null, 15000, ct);
                     if (cur.ErrorCode != 0)
                         throw new Sc4iCommandException("扫描 EtherCAT 从站 (PRE-OP)", cur);
                     if (cur.SlaveCount != 4 || !HasFourPopulatedIdentities(cur))
@@ -290,17 +268,17 @@ namespace NewCard.Core
                 Sc4iMachineConfig cfg = Sc4iMachineConfig.CreateForScannedSlaves(ids, 6u);
                 byte[] cfgBytes = cfg.Serialize();
 
-                Sc4iStatusReply uploaded = SendNextF2("下发 528B 运动卡配置", Sc4iSubcmd.UploadConfig, 0, cfgBytes, 5000, ct);
+                Sc4iStatusReply uploaded = SendNextF2(Sc4iSubcmd.UploadConfig, 0, cfgBytes, 5000, ct);
                 if (uploaded.ErrorCode != 0)
                     throw new Sc4iCommandException("下发 528B 运动卡配置", uploaded);
 
-                Sc4iStatusReply initialized = SendNextF2("初始化总线进入 OP（不上使能）", Sc4iSubcmd.BusInit, 0, null, 15000, ct);
+                Sc4iStatusReply initialized = SendNextF2(Sc4iSubcmd.BusInit, 0, null, 15000, ct);
                 if (initialized.ErrorCode != 0)
                     throw new Sc4iCommandException("初始化总线进入 OP", initialized);
 
                 // Let the 1 kHz cyclic PDO loop run ~60 cycles so live StatusWord / ActualPos / Mode populate.
                 await Task.Delay(60, ct).ConfigureAwait(false);
-                Sc4iStatusReply live = SendNextF2("读取 OP 实时状态", Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
+                Sc4iStatusReply live = SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
                 if (live.ErrorCode != 0)
                     throw new Sc4iCommandException("读取 OP 实时状态", live);
                 return live;
@@ -327,30 +305,11 @@ namespace NewCard.Core
             ValidateJointIndex(jointIndex);
             if (Double.IsNaN(targetRev) || Double.IsInfinity(targetRev))
                 throw new ArgumentOutOfRangeException("targetRev", "目标圈数必须是有限数。");
-            if (Double.IsNaN(velRevPerSec) || Double.IsInfinity(velRevPerSec) || velRevPerSec < 0.005 || velRevPerSec > MaxSafeVelocityRevPerSec)
-                throw new ArgumentOutOfRangeException("velRevPerSec", "速度必须在 0.005 至 " + MaxSafeVelocityRevPerSec + " rev/s 之间。");
-            if (Double.IsNaN(accRevPerSec2) || Double.IsInfinity(accRevPerSec2) || accRevPerSec2 < 0.05 || accRevPerSec2 > MaxSafeAccelerationRevPerSec2)
-                throw new ArgumentOutOfRangeException("accRevPerSec2", "加速度必须在 0.05 至 " + MaxSafeAccelerationRevPerSec2 + " rev/s² 之间。");
+            ValidateVelocityAndAcceleration(velRevPerSec, accRevPerSec2);
 
             return RunConnectedAsync(cancellationToken, ct =>
             {
-                Sc4iStatusReply status = SendNextF2("运动前状态核查", Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
-                if (status.ErrorCode != 0)
-                    throw new Sc4iCommandException("运动前状态核查", status);
-                if (!status.BusReady || !status.PdoOk || status.PdoAgeMs == uint.MaxValue || status.PdoAgeMs >= MaxFreshPdoAgeMs)
-                    throw new InvalidOperationException("EtherCAT 总线未处于就绪 OP 或 PDO 刷新超时，禁止启动运动。");
-                if (status.LatchedFault != 0 || status.EstopFlag != 0)
-                    throw new InvalidOperationException("存在锁存故障或急停标志，请先排查并清除锁存。");
-                if (!status.IsAxisEnabled(jointIndex) || !status.IsAxisAuthorized(jointIndex))
-                    throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 未处于使能且授权状态，请先使能授权。");
-                if (status.MotionState != 0)
-                    throw new InvalidOperationException("当前已有运动正在执行，请等待完成或先停止。");
-                if (status.Slaves == null || status.Slaves.Length <= jointIndex || status.Slaves[jointIndex] == null
-                    || status.Slaves[jointIndex].ValidMask == 0)
-                    throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 实时遥测无效，禁止基于未确认位置启动运动。");
-                if (status.Slaves[jointIndex].IsFault)
-                    throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 存在伺服驱动器报警，禁止启动运动。");
-
+                Sc4iStatusReply status = CheckPreMotionSafety(jointIndex, ct);
                 double currentRev = status.Slaves[jointIndex].ActualRevolutions(CountsPerRevolution);
                 double deltaRev = targetRev - currentRev;
                 if (Math.Abs(deltaRev) < 0.0005)
@@ -359,7 +318,7 @@ namespace NewCard.Core
                     throw new ArgumentOutOfRangeException("targetRev", "单轴目标位移 " + deltaRev.ToString("0.###") + " 圈超过安全上限 ±" + MaxSafeStepRev + " 圈。");
 
                 byte[] payload = Sc4iProtocol.BuildMoveAxisPtpPayload(targetRev, velRevPerSec, accRevPerSec2);
-                Sc4iStatusReply reply = SendNextF2("轴 " + (jointIndex + 1) + " 绝对定位", Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 3000, ct);
+                Sc4iStatusReply reply = SendNextF2(Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 3000, ct);
                 if (reply.ErrorCode != 0)
                     throw new Sc4iCommandException("轴 " + (jointIndex + 1) + " 绝对定位", reply);
                 return Task.FromResult(reply);
@@ -372,34 +331,15 @@ namespace NewCard.Core
             ValidateJointIndex(jointIndex);
             if (Double.IsNaN(deltaRev) || Double.IsInfinity(deltaRev) || deltaRev == 0.0 || Math.Abs(deltaRev) > MaxSafeStepRev)
                 throw new ArgumentOutOfRangeException("deltaRev", "单次相对步长必须非零且不超过 ±" + MaxSafeStepRev + " 圈。");
-            if (Double.IsNaN(velRevPerSec) || Double.IsInfinity(velRevPerSec) || velRevPerSec < 0.005 || velRevPerSec > MaxSafeVelocityRevPerSec)
-                throw new ArgumentOutOfRangeException("velRevPerSec", "速度必须在 0.005 至 " + MaxSafeVelocityRevPerSec + " rev/s 之间。");
-            if (Double.IsNaN(accRevPerSec2) || Double.IsInfinity(accRevPerSec2) || accRevPerSec2 < 0.05 || accRevPerSec2 > MaxSafeAccelerationRevPerSec2)
-                throw new ArgumentOutOfRangeException("accRevPerSec2", "加速度必须在 0.05 至 " + MaxSafeAccelerationRevPerSec2 + " rev/s² 之间。");
+            ValidateVelocityAndAcceleration(velRevPerSec, accRevPerSec2);
 
             return RunConnectedAsync(cancellationToken, ct =>
             {
-                Sc4iStatusReply status = SendNextF2("运动前状态核查", Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
-                if (status.ErrorCode != 0)
-                    throw new Sc4iCommandException("运动前状态核查", status);
-                if (!status.BusReady || !status.PdoOk || status.PdoAgeMs == uint.MaxValue || status.PdoAgeMs >= MaxFreshPdoAgeMs)
-                    throw new InvalidOperationException("EtherCAT 总线未处于就绪 OP 或 PDO 刷新超时，禁止启动运动。");
-                if (status.LatchedFault != 0 || status.EstopFlag != 0)
-                    throw new InvalidOperationException("存在锁存故障或急停标志，请先排查并清除锁存。");
-                if (!status.IsAxisEnabled(jointIndex) || !status.IsAxisAuthorized(jointIndex))
-                    throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 未处于使能且授权状态，请先点击“使能当前轴”。");
-                if (status.MotionState != 0)
-                    throw new InvalidOperationException("当前已有运动正在执行，请等待完成或先停止。");
-                if (status.Slaves == null || status.Slaves.Length <= jointIndex || status.Slaves[jointIndex] == null
-                    || status.Slaves[jointIndex].ValidMask == 0)
-                    throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 实时遥测无效，禁止基于未确认位置启动运动。");
-                if (status.Slaves[jointIndex].IsFault)
-                    throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 存在伺服驱动器报警，禁止启动运动。");
-
+                Sc4iStatusReply status = CheckPreMotionSafety(jointIndex, ct);
                 double currentRev = status.Slaves[jointIndex].ActualRevolutions(CountsPerRevolution);
                 double targetRev = currentRev + deltaRev;
                 byte[] payload = Sc4iProtocol.BuildMoveAxisPtpPayload(targetRev, velRevPerSec, accRevPerSec2);
-                Sc4iStatusReply reply = SendNextF2("轴 " + (jointIndex + 1) + " 相对定位", Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 3000, ct);
+                Sc4iStatusReply reply = SendNextF2(Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 3000, ct);
                 if (reply.ErrorCode != 0)
                     throw new Sc4iCommandException("轴 " + (jointIndex + 1) + " 相对定位", reply);
                 return Task.FromResult(reply);
@@ -429,23 +369,44 @@ namespace NewCard.Core
         {
             return RunConnectedAsync(cancellationToken, async ct =>
             {
-                Sc4iStatusReply status = SendNextF2("查询故障状态", Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
+                Sc4iStatusReply status = SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
                 if (status.ErrorCode != 0)
                     throw new Sc4iCommandException("查询故障状态", status);
                 byte faultMask = status.ComputeFaultedSlaveMask();
                 if (faultMask != 0)
                 {
-                    Sc4iStatusReply drvReset = SendNextF2("复位驱动器报警", Sc4iSubcmd.FaultReset, faultMask, null, 3000, ct);
+                    Sc4iStatusReply drvReset = SendNextF2(Sc4iSubcmd.FaultReset, faultMask, null, 3000, ct);
                     if (drvReset.ErrorCode != 0)
                         throw new Sc4iCommandException("复位驱动器报警", drvReset);
                     await Task.Delay(120, ct).ConfigureAwait(false);
                 }
 
-                Sc4iStatusReply cleared = SendNextF2("清除控制器故障/停机锁存", Sc4iSubcmd.FaultReset, 0, null, 3000, ct);
+                Sc4iStatusReply cleared = SendNextF2(Sc4iSubcmd.FaultReset, 0, null, 3000, ct);
                 if (cleared.ErrorCode != 0)
                     throw new Sc4iCommandException("清除控制器故障/停机锁存", cleared);
                 return cleared;
             });
+        }
+
+        private Sc4iStatusReply CheckPreMotionSafety(int jointIndex, CancellationToken ct)
+        {
+            Sc4iStatusReply status = SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
+            if (status.ErrorCode != 0)
+                throw new Sc4iCommandException("运动前状态核查", status);
+            if (!status.IsPdoFresh(MaxFreshPdoAgeMs))
+                throw new InvalidOperationException("EtherCAT 总线未处于就绪 OP 或 PDO 刷新超时，禁止启动运动。");
+            if (status.LatchedFault != 0 || status.EstopFlag != 0)
+                throw new InvalidOperationException("存在锁存故障或急停标志，请先排查并清除锁存。");
+            if (!status.IsAxisEnabled(jointIndex) || !status.IsAxisAuthorized(jointIndex))
+                throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 未处于使能且授权状态，请先使能授权。");
+            if (status.MotionState != 0)
+                throw new InvalidOperationException("当前已有运动正在执行，请等待完成或先停止。");
+            if (status.Slaves == null || status.Slaves.Length <= jointIndex || status.Slaves[jointIndex] == null
+                || status.Slaves[jointIndex].ValidMask == 0)
+                throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 实时遥测无效，禁止基于未确认位置启动运动。");
+            if (status.Slaves[jointIndex].IsFault)
+                throw new InvalidOperationException("轴 " + (jointIndex + 1) + " 存在伺服驱动器报警，禁止启动运动。");
+            return status;
         }
 
         private Task<Sc4iStatusReply> ExecuteF2Async(
@@ -454,7 +415,7 @@ namespace NewCard.Core
             return RunConnectedAsync(cancellationToken, ct =>
             {
                 int effectiveTimeout = timeoutMs > 0 ? timeoutMs : defaultTimeoutMs;
-                Sc4iStatusReply reply = SendNextF2(action, subcmd, arg, payload, effectiveTimeout, ct);
+                Sc4iStatusReply reply = SendNextF2(subcmd, arg, payload, effectiveTimeout, ct);
                 if (throwOnErrorCode && reply.ErrorCode != 0)
                     throw new Sc4iCommandException(action, reply);
                 return Task.FromResult(reply);
@@ -482,7 +443,7 @@ namespace NewCard.Core
             });
         }
 
-        private Sc4iStatusReply SendNextF2(string action, Sc4iSubcmd subcmd, byte arg, byte[] payload, int timeoutMs, CancellationToken ct)
+        private Sc4iStatusReply SendNextF2(Sc4iSubcmd subcmd, byte arg, byte[] payload, int timeoutMs, CancellationToken ct)
         {
             int perAttemptTimeoutMs;
             int maxAttempts;
@@ -502,7 +463,7 @@ namespace NewCard.Core
                 if (seq > maxUsedSeq) maxUsedSeq = seq;
                 try
                 {
-                    Sc4iStatusReply reply = SendF2Internal(socket, remoteEndPoint, subcmd, arg, seq, bootId, sessionId, payload, attemptTimeout, ct);
+                    Sc4iStatusReply reply = SendF2OnChannel(channel, subcmd, arg, seq, bootId, sessionId, payload, attemptTimeout, ct);
                     lock (stateLock)
                     {
                         lastStatus = reply;
@@ -548,165 +509,44 @@ namespace NewCard.Core
             }
         }
 
-        private static Sc4iStatusReply SendF2InternalWithRetry(
-            Socket udp, IPEndPoint remote, Sc4iSubcmd subcmd, byte arg, uint seq, ulong bootIdVal, ulong sessionIdVal,
+        private static Sc4iStatusReply SendF2OnChannelWithRetry(
+            UdpFrameChannel targetChannel, Sc4iSubcmd subcmd, byte arg, uint seq, ulong bootIdVal, ulong sessionIdVal,
             byte[] payload, int overallTimeoutMs, int perAttemptTimeoutMs, int maxAttempts, CancellationToken ct)
         {
             byte[] req = Sc4iProtocol.BuildF2Request(subcmd, arg, seq, bootIdVal, sessionIdVal, payload);
-            byte expectedToken = (byte)(seq & 0x7F);
-            return ExchangeValidatedWithRetry(
-                udp, remote, req, Sc4iProtocol.F2ReplyLength, overallTimeoutMs, perAttemptTimeoutMs, maxAttempts, ct,
-                raw =>
-                {
-                    Sc4iStatusReply parsed = Sc4iProtocol.ParseF2Reply(raw);
-                    if (parsed.Subcmd != (byte)subcmd)
-                        throw new ProtocolException("应答子命令不匹配：期望 0x" + ((byte)subcmd).ToString("X2", CultureInfo.InvariantCulture)
-                            + "，实际 0x" + parsed.Subcmd.ToString("X2", CultureInfo.InvariantCulture));
-                    if (seq != 0 && parsed.ErrorCode != 0x35u && parsed.Seq != seq && parsed.FrameToken != expectedToken)
-                        throw new ProtocolException("应答序列号与本次请求不一致（期望 seq=" + seq + "，收到 seq=" + parsed.Seq + "）");
-                    return parsed;
-                });
+            return targetChannel.ExchangeValidatedWithRetry(
+                req, Sc4iProtocol.F2ReplyLength, overallTimeoutMs, perAttemptTimeoutMs, maxAttempts, ct,
+                raw => ParseAndValidateF2Reply(raw, subcmd, seq));
         }
 
-        private static T ExchangeValidatedWithRetry<T>(
-            Socket udp, IPEndPoint remote, byte[] request, int expectedLength, int overallTimeoutMs, int perAttemptTimeoutMs, int maxAttempts,
-            CancellationToken ct, Func<byte[], T> parser)
-        {
-            Stopwatch overall = Stopwatch.StartNew();
-            TimeoutException lastTimeout = null;
-            for (int attempt = 0; attempt < maxAttempts; attempt++)
-            {
-                int remaining = overallTimeoutMs - (int)overall.ElapsedMilliseconds;
-                if (remaining <= 0) break;
-                int attemptTimeout = Math.Min(perAttemptTimeoutMs, remaining);
-                if (attemptTimeout < 30 && attempt > 0) break;
-                try
-                {
-                    return ExchangeValidated(udp, remote, request, expectedLength, attemptTimeout, ct, parser);
-                }
-                catch (TimeoutException ex)
-                {
-                    lastTimeout = ex;
-                    if (attempt + 1 >= maxAttempts || ct.IsCancellationRequested)
-                        throw;
-                }
-            }
-            throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + overallTimeoutMs + " ms）。");
-        }
-
-        private static Sc4iStatusReply SendF2Internal(
-            Socket udp, IPEndPoint remote, Sc4iSubcmd subcmd, byte arg, uint seq, ulong bootIdVal, ulong sessionIdVal,
+        private static Sc4iStatusReply SendF2OnChannel(
+            UdpFrameChannel targetChannel, Sc4iSubcmd subcmd, byte arg, uint seq, ulong bootIdVal, ulong sessionIdVal,
             byte[] payload, int timeoutMs, CancellationToken ct)
         {
             byte[] req = Sc4iProtocol.BuildF2Request(subcmd, arg, seq, bootIdVal, sessionIdVal, payload);
-            byte expectedToken = (byte)(seq & 0x7F);
-            return ExchangeValidated(
-                udp, remote, req, Sc4iProtocol.F2ReplyLength, timeoutMs, ct,
-                raw =>
-                {
-                    Sc4iStatusReply parsed = Sc4iProtocol.ParseF2Reply(raw);
-                    if (parsed.Subcmd != (byte)subcmd)
-                        throw new ProtocolException("应答子命令不匹配：期望 0x" + ((byte)subcmd).ToString("X2", CultureInfo.InvariantCulture)
-                            + "，实际 0x" + parsed.Subcmd.ToString("X2", CultureInfo.InvariantCulture));
-                    if (seq != 0 && parsed.ErrorCode != 0x35u && parsed.Seq != seq && parsed.FrameToken != expectedToken)
-                        throw new ProtocolException("应答序列号与本次请求不一致（期望 seq=" + seq + "，收到 seq=" + parsed.Seq + "）");
-                    return parsed;
-                });
+            return targetChannel.ExchangeValidated(
+                req, Sc4iProtocol.F2ReplyLength, timeoutMs, ct,
+                raw => ParseAndValidateF2Reply(raw, subcmd, seq));
         }
 
-        private static T ExchangeValidated<T>(
-            Socket udp, IPEndPoint remote, byte[] request, int expectedLength, int timeoutMs, CancellationToken ct,
-            Func<byte[], T> parser)
+        private static Sc4iStatusReply ParseAndValidateF2Reply(byte[] raw, Sc4iSubcmd expectedSubcmd, uint expectedSeq)
         {
-            ct.ThrowIfCancellationRequested();
-            // Drain any stale queued datagrams before sending the new request.
-            byte[] buffer = new byte[65535];
-            while (udp.Poll(0, SelectMode.SelectRead))
-            {
-                EndPoint stale = new IPEndPoint(IPAddress.Any, 0);
-                try
-                {
-                    udp.ReceiveFrom(buffer, ref stale);
-                }
-                catch (SocketException ex)
-                {
-                    if (ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.MessageSize)
-                        continue;
-                    break;
-                }
-                catch
-                {
-                    break;
-                }
-            }
-
-            Stopwatch sw = Stopwatch.StartNew();
-            udp.SendTo(request, remote);
-            string lastReject = null;
-            while (sw.ElapsedMilliseconds < timeoutMs)
-            {
-                ct.ThrowIfCancellationRequested();
-                if (!udp.Poll(10000, SelectMode.SelectRead)) continue;
-                EndPoint src = new IPEndPoint(IPAddress.Any, 0);
-                int n;
-                try
-                {
-                    n = udp.ReceiveFrom(buffer, ref src);
-                }
-                catch (SocketException ex)
-                {
-                    if (ex.SocketErrorCode == SocketError.ConnectionReset)
-                    {
-                        lastReject = "收到 ICMP 端口不可达 (WSAECONNRESET)";
-                        continue;
-                    }
-                    if (ex.SocketErrorCode == SocketError.MessageSize)
-                    {
-                        lastReject = "收到超长 UDP 报文，已忽略";
-                        continue;
-                    }
-                    throw;
-                }
-                if (!remote.Equals(src))
-                {
-                    lastReject = "收到非目标端点的 UDP 包";
-                    continue;
-                }
-                if (n != expectedLength)
-                {
-                    lastReject = "应答长度 " + n + " 与期望 " + expectedLength + " 不符";
-                    continue;
-                }
-                byte[] copy = new byte[n];
-                Array.Copy(buffer, copy, n);
-                try
-                {
-                    T parsed = parser(copy);
-                    ct.ThrowIfCancellationRequested();
-                    return parsed;
-                }
-                catch (FormatException error)
-                {
-                    lastReject = error.Message;
-                }
-            }
-            ct.ThrowIfCancellationRequested();
-            throw new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。"
-                + (lastReject == null ? "" : " 最后忽略原因：" + lastReject));
+            byte expectedToken = (byte)(expectedSeq & 0x7F);
+            Sc4iStatusReply parsed = Sc4iProtocol.ParseF2Reply(raw);
+            if (parsed.Subcmd != (byte)expectedSubcmd)
+                throw new ProtocolException("应答子命令不匹配：期望 0x" + ((byte)expectedSubcmd).ToString("X2", CultureInfo.InvariantCulture)
+                    + "，实际 0x" + parsed.Subcmd.ToString("X2", CultureInfo.InvariantCulture));
+            if (expectedSeq != 0 && parsed.ErrorCode != 0x35u && parsed.Seq != expectedSeq && parsed.FrameToken != expectedToken)
+                throw new ProtocolException("应答序列号与本次请求不一致（期望 seq=" + expectedSeq + "，收到 seq=" + parsed.Seq + "）");
+            return parsed;
         }
 
-        private static void ConfigureUdpSocket(Socket udp)
+        private static void ValidateVelocityAndAcceleration(double velRevPerSec, double accRevPerSec2)
         {
-            udp.ExclusiveAddressUse = true;
-            try
-            {
-                // On Windows, ignore ICMP Port Unreachable errors on UDP sockets.
-                udp.IOControl((IOControlCode)SioUdpConnReset, new byte[] { 0 }, null);
-            }
-            catch
-            {
-                // Unsupported on non-Windows platforms; safe to ignore.
-            }
+            if (Double.IsNaN(velRevPerSec) || Double.IsInfinity(velRevPerSec) || velRevPerSec < 0.005 || velRevPerSec > MaxSafeVelocityRevPerSec)
+                throw new ArgumentOutOfRangeException("velRevPerSec", "速度必须在 0.005 至 " + MaxSafeVelocityRevPerSec + " rev/s 之间。");
+            if (Double.IsNaN(accRevPerSec2) || Double.IsInfinity(accRevPerSec2) || accRevPerSec2 < 0.05 || accRevPerSec2 > MaxSafeAccelerationRevPerSec2)
+                throw new ArgumentOutOfRangeException("accRevPerSec2", "加速度必须在 0.05 至 " + MaxSafeAccelerationRevPerSec2 + " rev/s² 之间。");
         }
 
         private static bool HasFourPopulatedIdentities(Sc4iStatusReply status)
@@ -753,29 +593,6 @@ namespace NewCard.Core
             return candidate;
         }
 
-        private static IPAddress ParseUnicast(string text, string name)
-        {
-            if (String.IsNullOrWhiteSpace(text))
-                throw new ArgumentException(name + " 必须是 IPv4 地址。");
-            string trimmed = text.Trim();
-            string[] parts = trimmed.Split('.');
-            if (parts.Length != 4)
-                throw new ArgumentException(name + " 必须是完整的四段 IPv4 地址。");
-            for (int i = 0; i < 4; i++)
-            {
-                byte octet;
-                if (!Byte.TryParse(parts[i], NumberStyles.None, CultureInfo.InvariantCulture, out octet))
-                    throw new ArgumentException(name + " 必须是完整的四段 IPv4 地址。");
-            }
-            IPAddress address;
-            if (!IPAddress.TryParse(trimmed, out address) || address.AddressFamily != AddressFamily.InterNetwork)
-                throw new ArgumentException(name + " 必须是 IPv4 地址。");
-            byte[] bytes = address.GetAddressBytes();
-            if (bytes[0] == 0 || bytes[0] >= 224 || bytes[3] == 255)
-                throw new ArgumentException(name + " 必须是明确的单播地址。");
-            return address;
-        }
-
         private CancellationTokenSource CreateConnectLinkedCts(CancellationToken cancellationToken)
         {
             lock (stateLock)
@@ -791,7 +608,7 @@ namespace NewCard.Core
             {
                 if (disposed) throw new ObjectDisposedException("Sc4iClient");
                 if (!connected || sessionCts == null)
-                    throw new InvalidOperationException("尚未连接控制卡，请先点击“1. 连接控制卡”。");
+                    throw new InvalidOperationException("尚未连接控制卡，请先点击“连接”。");
                 return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, sessionCts.Token, disposeCts.Token);
             }
         }
@@ -799,33 +616,29 @@ namespace NewCard.Core
         private void EnsureConnected()
         {
             ThrowIfDisposed();
-            if (socket == null || !connected || bootId == 0 || sessionId == 0)
-                throw new InvalidOperationException("尚未连接控制卡，请先点击“1. 连接控制卡”。");
+            if (channel == null || !connected || bootId == 0 || sessionId == 0)
+                throw new InvalidOperationException("尚未连接控制卡，请先点击“连接”。");
         }
 
         private void CancelSessionInternal()
         {
             CancellationTokenSource cts;
-            lock (stateLock)
-            {
-                cts = sessionCts;
-            }
+            lock (stateLock) { cts = sessionCts; }
             if (cts != null)
             {
                 try { cts.Cancel(); } catch { }
             }
         }
 
-        private void CloseSocketInternal()
+        private void CloseChannelInternal()
         {
-            Socket oldSocket;
+            UdpFrameChannel oldChannel;
             CancellationTokenSource oldCts;
             lock (stateLock)
             {
-                oldSocket = socket;
+                oldChannel = channel;
                 oldCts = sessionCts;
-                socket = null;
-                remoteEndPoint = null;
+                channel = null;
                 sessionCts = null;
                 connected = false;
                 bootId = 0;
@@ -838,10 +651,7 @@ namespace NewCard.Core
                 try { oldCts.Cancel(); } catch { }
                 try { oldCts.Dispose(); } catch { }
             }
-            if (oldSocket != null)
-            {
-                try { oldSocket.Dispose(); } catch { }
-            }
+            if (oldChannel != null) oldChannel.Dispose();
         }
 
         private void ThrowIfDisposed()
@@ -873,7 +683,7 @@ namespace NewCard.Core
                 acquired = gate.Wait(500);
             }
             catch (ObjectDisposedException) { }
-            CloseSocketInternal();
+            CloseChannelInternal();
             if (acquired)
             {
                 SafeReleaseGate();

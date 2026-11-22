@@ -1,7 +1,8 @@
 using System;
 using System.Windows.Forms;
+using ScaraArm.Console.Diagnostics;
 
-namespace NewCardDemo
+namespace ScaraArm.Console
 {
     internal static class Program
     {
@@ -16,13 +17,13 @@ namespace NewCardDemo
                 else if (args[index] == "--screenshot" && index + 1 < args.Length) screenshotPath = args[++index];
                 else
                 {
-                    Console.Error.WriteLine("用法：NewCardDemo.exe [--ui-smoke-test] [--screenshot <PNG路径>]");
+                    System.Console.Error.WriteLine("用法：ScaraArm.Console.exe [--ui-smoke-test] [--screenshot <PNG路径>]");
                     return 2;
                 }
             }
             if (!smokeTest && screenshotPath != null)
             {
-                Console.Error.WriteLine("--screenshot 需要同时使用 --ui-smoke-test。");
+                System.Console.Error.WriteLine("--screenshot 需要同时使用 --ui-smoke-test。");
                 return 2;
             }
 
@@ -40,13 +41,13 @@ namespace NewCardDemo
                             try
                             {
                                 string report;
-                                bool passed = form.RunSmokeTest(screenshotPath, out report);
-                                Console.WriteLine(report);
+                                bool passed = UiSmokeTest.Run(form, screenshotPath, out report);
+                                System.Console.WriteLine(report);
                                 result = passed ? 0 : 1;
                             }
                             catch (Exception error)
                             {
-                                Console.Error.WriteLine("离线界面检查失败：" + error);
+                                System.Console.Error.WriteLine("离线界面检查失败：" + error);
                                 result = 1;
                             }
                             finally { form.Close(); }
