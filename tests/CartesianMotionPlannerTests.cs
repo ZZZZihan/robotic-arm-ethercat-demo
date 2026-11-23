@@ -143,6 +143,34 @@ namespace ScaraArm.Tests
                     estopFake, plan, 0.35, 1.0, "急停中断", null, 0, 5000, CancellationToken.None).GetAwaiter().GetResult(),
                 "Mid-sequence E-Stop aborts execution");
             t.Check(estopFake.MovedAxes.Count == 1, "Only first axis was commanded before E-Stop halted remaining steps");
+
+            // 3. Single transient heartbeat timeout during arrival polling is tolerated (and counter resets on reply)
+            FakeMotionClient singleTimeoutFake = new FakeMotionClient(cal.ZeroCounts);
+            singleTimeoutFake.TimeoutOnHeartbeatNumbers.Add(1);
+            singleTimeoutFake.TimeoutOnHeartbeatNumbers.Add(3);
+            Sc4iStatusReply tolerated = await CartesianMotionPlanner.ExecutePlanAsync(
+                singleTimeoutFake, plan, 0.35, 1.0, "瞬时超时容错", null, 0, 5000, CancellationToken.None).ConfigureAwait(false);
+            t.Check(tolerated != null && singleTimeoutFake.MovedAxes.Count == 3,
+                "ExecutePlanAsync tolerated isolated single heartbeat timeouts and completed all 3 axes");
+
+            // 4. Two consecutive heartbeat timeouts abort execution
+            FakeMotionClient doubleTimeoutFake = new FakeMotionClient(cal.ZeroCounts);
+            doubleTimeoutFake.TimeoutOnHeartbeatNumbers.Add(1);
+            doubleTimeoutFake.TimeoutOnHeartbeatNumbers.Add(2);
+            t.Throws<TimeoutException>(() =>
+                CartesianMotionPlanner.ExecutePlanAsync(
+                    doubleTimeoutFake, plan, 0.35, 1.0, "连续超时中止", null, 0, 5000, CancellationToken.None).GetAwaiter().GetResult(),
+                "Two consecutive heartbeat timeouts abort execution");
+
+            // 5. Recommended step timeout scaling respects minimum bound and scales for slow/long moves
+            int shortMoveTimeout = CartesianMotionPlanner.ComputeRecommendedStepTimeoutMs(0.5, 0.5, 1.0);
+            t.Check(shortMoveTimeout == CartesianMotionPlanner.DefaultStepTimeoutMs,
+                "Short move uses DefaultStepTimeoutMs floor (25000 ms)");
+            int slowLongMoveTimeout = CartesianMotionPlanner.ComputeRecommendedStepTimeoutMs(18.0, 0.2, 1.0);
+            t.Check(slowLongMoveTimeout >= 102000 && slowLongMoveTimeout < 180000,
+                "Slow/long move scales recommended timeout dynamically");
+            int cappedMoveTimeout = CartesianMotionPlanner.ComputeRecommendedStepTimeoutMs(20.0, 0.05, 1.0);
+            t.Check(cappedMoveTimeout == 180000, "Extreme slow move timeout caps at 180000 ms");
         }
 
         private sealed class FakeMotionClient : ISc4iMotionClient
@@ -150,6 +178,7 @@ namespace ScaraArm.Tests
             private readonly int[] counts;
             private int heartbeatCalls;
             public readonly List<int> MovedAxes = new List<int>();
+            public readonly HashSet<int> TimeoutOnHeartbeatNumbers = new HashSet<int>();
             public int TriggerEstopOnHeartbeatNumber { get; set; }
 
             public bool IsConnected { get { return true; } }
@@ -171,6 +200,8 @@ namespace ScaraArm.Tests
             public Task<Sc4iStatusReply> SendHeartbeatAsync(CancellationToken cancellationToken)
             {
                 heartbeatCalls++;
+                if (TimeoutOnHeartbeatNumbers.Contains(heartbeatCalls))
+                    throw new TimeoutException("模拟瞬时心跳应答超时 #" + heartbeatCalls);
                 byte estop = (TriggerEstopOnHeartbeatNumber > 0 && heartbeatCalls == TriggerEstopOnHeartbeatNumber) ? (byte)1 : (byte)0;
                 return Task.FromResult(BuildReadyStatus(counts, motionState: 0, estop: estop));
             }

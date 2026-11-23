@@ -203,9 +203,13 @@ namespace ScaraArm.Tests
             uint pdoAgeMs = 0;
             uint validMaskOverride = 0x1Fu;
             int dropRepliesCount = 0;
+            int dropNextAcquireRequestCount = 0;
             int dropNextPtpRequestCount = 0;
             int dropNextPtpReplyOnlyCount = 0;
             int ptpExecutedCount = 0;
+            int dropNextJogRequestCount = 0;
+            int dropNextJogReplyOnlyCount = 0;
+            int jogExecutedCount = 0;
             int[] positions = { 262144, 0, 0, 0 };
             ushort[] statusWords = { 0x1627, 0x1650, 0x1650, 0x1650 };
             ushort[] driveErrors = { 0, 0, 0, 0 };
@@ -261,6 +265,11 @@ namespace ScaraArm.Tests
 
                             if (sub == Sc4iSubcmd.AcquireSession)
                             {
+                                if (dropNextAcquireRequestCount > 0)
+                                {
+                                    dropNextAcquireRequestCount--;
+                                    continue;
+                                }
                                 if (activeSid == 0)
                                 {
                                     activeSid = sid;
@@ -291,6 +300,11 @@ namespace ScaraArm.Tests
                                     dropNextPtpRequestCount--;
                                     continue;
                                 }
+                                if (sub == Sc4iSubcmd.JogAxis && dropNextJogRequestCount > 0)
+                                {
+                                    dropNextJogRequestCount--;
+                                    continue;
+                                }
                                 if (seq <= lastAcceptedSeq) err = 0x35u;
                                 else
                                 {
@@ -303,6 +317,15 @@ namespace ScaraArm.Tests
                                         if (dropNextPtpReplyOnlyCount > 0)
                                         {
                                             dropNextPtpReplyOnlyCount--;
+                                            continue;
+                                        }
+                                    }
+                                    else if (sub == Sc4iSubcmd.JogAxis)
+                                    {
+                                        jogExecutedCount++;
+                                        if (dropNextJogReplyOnlyCount > 0)
+                                        {
+                                            dropNextJogReplyOnlyCount--;
                                             continue;
                                         }
                                     }
@@ -387,6 +410,14 @@ namespace ScaraArm.Tests
                 t.Check(recoveredHb.ErrorCode == 0u && dropRepliesCount == 0 && retrySw.ElapsedMilliseconds < 700,
                     "Heartbeat recovered from 2 dropped UDP packets promptly");
 
+                // 7-packet consecutive burst loss (reproducing live 12:55:15 EMI burst)
+                dropRepliesCount = 7;
+                Stopwatch burstSw = Stopwatch.StartNew();
+                Sc4iStatusReply burstRecovered = await client.SendHeartbeatAsync(CancellationToken.None).ConfigureAwait(false);
+                burstSw.Stop();
+                t.Check(burstRecovered.ErrorCode == 0u && dropRepliesCount == 0 && burstSw.ElapsedMilliseconds < 700,
+                    "Heartbeat recovered from 7 consecutive dropped UDP replies within <700ms");
+
                 dropRepliesCount = 1;
                 Sc4iStatusReply recoveredJog = await client.SendJogKeepaliveAsync(CancellationToken.None).ConfigureAwait(false);
                 t.Check(recoveredJog.ErrorCode == 0u && dropRepliesCount == 0,
@@ -407,7 +438,27 @@ namespace ScaraArm.Tests
                     && Math.Abs(ptpRepRecovered.Slaves[0].ActualRevolutions(client.CountsPerRevolution) - 1.8) < 1e-4,
                     "MoveAxisPtp recovered from lost reply via 0x35 replay detection and Heartbeat confirmation");
 
-                dropRepliesCount = 10;
+                // StartJogAsync dropped request and dropped reply -> same-seq retry + 0x35 Heartbeat recovery
+                jogExecutedCount = 0;
+                dropNextJogRequestCount = 1;
+                Sc4iStatusReply jogReqRecovered = await client.StartJogAsync(0, 0.25, CancellationToken.None).ConfigureAwait(false);
+                t.Check(jogReqRecovered.ErrorCode == 0u && jogExecutedCount == 1 && dropNextJogRequestCount == 0,
+                    "StartJogAsync recovered from dropped request via same-seq retry");
+
+                jogExecutedCount = 0;
+                dropNextJogReplyOnlyCount = 1;
+                Sc4iStatusReply jogRepRecovered = await client.StartJogAsync(0, -0.25, CancellationToken.None).ConfigureAwait(false);
+                t.Check(jogRepRecovered.ErrorCode == 0u && jogExecutedCount == 1 && dropNextJogReplyOnlyCount == 0,
+                    "StartJogAsync recovered from lost reply via 0x35 detection without duplicate start");
+
+                // ConnectAsync (AcquireSession) recovers from dropped request packet
+                client.Disconnect();
+                dropNextAcquireRequestCount = 1;
+                Sc4iStatusReply reconnectedAfterDrop = await client.ConnectAsync("127.0.0.1", 0, "127.0.0.1", port, 2000, CancellationToken.None).ConfigureAwait(false);
+                t.Check(client.IsConnected && reconnectedAfterDrop.ErrorCode == 0u && dropNextAcquireRequestCount == 0,
+                    "ConnectAsync (AcquireSession) recovered from 1 dropped request packet");
+
+                dropRepliesCount = 30;
                 Task<Sc4iStatusReply> stalled = client.SendHeartbeatAsync(CancellationToken.None);
                 await Task.Delay(80).ConfigureAwait(false);
                 Stopwatch sw = Stopwatch.StartNew();
