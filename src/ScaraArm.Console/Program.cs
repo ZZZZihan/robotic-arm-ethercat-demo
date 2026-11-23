@@ -30,7 +30,7 @@ namespace ScaraArm.Console
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             int result = 0;
-            using (MainForm form = new MainForm())
+            using (MainForm form = new MainForm(!smokeTest))
             {
                 if (smokeTest)
                 {

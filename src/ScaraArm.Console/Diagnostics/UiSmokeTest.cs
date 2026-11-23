@@ -77,8 +77,13 @@ namespace ScaraArm.Console.Diagnostics
             form.Update();
             Rectangle controlBounds = form.GetControlPanelClientBounds();
             Rectangle statusBounds = form.GetStatusLabelClientBounds();
-            check(controlBounds.Bottom <= form.ClientSize.Height && statusBounds.Bottom <= form.ClientSize.Height,
+            Rectangle linkBounds = form.GetLinkQualityLabelClientBounds();
+            check(controlBounds.Bottom <= form.ClientSize.Height
+                && statusBounds.Bottom <= form.ClientSize.Height
+                && linkBounds.Bottom <= form.ClientSize.Height
+                && linkBounds.Right <= form.ClientSize.Width,
                 "主控区与状态行完整位于窗口视口内");
+            check(form.LinkQualityText == "离线", "离线时链路状态显示为离线");
             check(!form.IsHardwareConnected, "全过程零硬件通信");
 
             if (!String.IsNullOrWhiteSpace(screenshotPath))

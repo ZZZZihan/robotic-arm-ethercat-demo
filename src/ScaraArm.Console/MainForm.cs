@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading;
 using System.Windows.Forms;
 using ScaraArm.Console.Controls;
+using ScaraArm.Console.Diagnostics;
 using ScaraArm.Console.Dialogs;
 using ScaraArm.Console.Theme;
 using ScaraArm.Core.Kinematics;
@@ -34,6 +35,7 @@ namespace ScaraArm.Console
         private readonly UiTheme theme = new UiTheme();
         private readonly Icon appIcon;
         private readonly Sc4iClient sc4iClient = new Sc4iClient();
+        private readonly ConsoleDiagnosticLogger logger;
         private readonly System.Windows.Forms.Timer pollTimer;
         private readonly System.Windows.Forms.Timer jogTimer;
 
@@ -64,6 +66,7 @@ namespace ScaraArm.Console
         private readonly CartesianControlPanel cartesianPanel;
         private readonly TeachTaskPanel teachPanel;
         private readonly Label statusLabel = new Label();
+        private readonly Label linkQualityLabel = new Label();
 
         private ConsoleControlMode controlMode = ConsoleControlMode.Joint;
         private int selectedAxis;
@@ -100,7 +103,11 @@ namespace ScaraArm.Console
         internal CartesianControlPanel CartesianPanel { get { return cartesianPanel; } }
         internal TeachTaskPanel TeachPanel { get { return teachPanel; } }
 
-        internal MainForm()
+        internal MainForm() : this(true)
+        {
+        }
+
+        internal MainForm(bool enableFileLogging)
         {
             Text = WindowTitle;
             appIcon = LoadAppIcon();
@@ -113,6 +120,11 @@ namespace ScaraArm.Console
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.Dpi;
             DoubleBuffered = true;
+
+            logger = new ConsoleDiagnosticLogger(
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs"),
+                enableFileLogging);
+            sc4iClient.DiagnosticEvent += OnClientDiagnosticEvent;
 
             try { calibration = ScaraCalibration.LoadOrDefault(calibrationPath); }
             catch { calibration = new ScaraCalibration(); }
@@ -162,6 +174,13 @@ namespace ScaraArm.Console
             return RectangleToClient(statusLabel.RectangleToScreen(statusLabel.ClientRectangle));
         }
 
+        internal Rectangle GetLinkQualityLabelClientBounds()
+        {
+            return RectangleToClient(linkQualityLabel.RectangleToScreen(linkQualityLabel.ClientRectangle));
+        }
+
+        internal string LinkQualityText { get { return linkQualityLabel.Text; } }
+
         internal void SelectAxis(int index)
         {
             if (index < 0 || index >= 4) return;
@@ -203,12 +222,28 @@ namespace ScaraArm.Console
             root.Controls.Add(BuildModeBar(), 0, 3);
             root.Controls.Add(BuildControlCard(), 0, 4);
 
+            TableLayoutPanel statusBar = UiTheme.CreateGrid(2, 1);
+            statusBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            statusBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            statusBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
             statusLabel.Dock = DockStyle.Fill;
             statusLabel.Font = theme.Small;
             statusLabel.ForeColor = UiTheme.Muted;
             statusLabel.TextAlign = ContentAlignment.BottomLeft;
             statusLabel.AutoEllipsis = true;
-            root.Controls.Add(statusLabel, 0, 5);
+
+            linkQualityLabel.AutoSize = true;
+            linkQualityLabel.Dock = DockStyle.Fill;
+            linkQualityLabel.Font = theme.Small;
+            linkQualityLabel.ForeColor = UiTheme.Muted;
+            linkQualityLabel.TextAlign = ContentAlignment.BottomRight;
+            linkQualityLabel.Margin = new Padding(12, 0, 0, 0);
+            linkQualityLabel.Text = "离线";
+
+            statusBar.Controls.Add(statusLabel, 0, 0);
+            statusBar.Controls.Add(linkQualityLabel, 1, 0);
+            root.Controls.Add(statusBar, 0, 5);
         }
 
         private Control BuildTopBar()
@@ -707,6 +742,7 @@ namespace ScaraArm.Console
             bool hasFault = sessionLost || heartbeatFailCount > 0 || (st != null && (st.LatchedFault != 0 || st.EstopFlag != 0 || pdoStale));
 
             UpdateTopBar(connected, busReady, commOk, pdoStale, hasFault, holdProtectionOnly, st);
+            UpdateLinkQualityIndicator(connected);
 
             int[] liveCounts = null;
             bool hasLiveCounts = st != null && st.TryExtractLiveCounts(out liveCounts);
@@ -988,6 +1024,56 @@ namespace ScaraArm.Console
             statusLabel.ForeColor = color;
         }
 
+        private void OnClientDiagnosticEvent(Sc4iTransportEvent ev)
+        {
+            logger.LogTransportEvent(ev);
+        }
+
+        private void UpdateLinkQualityIndicator(bool connected)
+        {
+            if (!connected)
+            {
+                linkQualityLabel.Text = "离线";
+                linkQualityLabel.ForeColor = UiTheme.Muted;
+                return;
+            }
+
+            Sc4iLinkQualitySnapshot snap = sc4iClient.GetLinkQualitySnapshot();
+            if (snap.TotalExchanges == 0)
+            {
+                linkQualityLabel.Text = "链路 --";
+                linkQualityLabel.ForeColor = UiTheme.Muted;
+                return;
+            }
+
+            if (snap.IsSevere)
+            {
+                linkQualityLabel.Text = String.Format(
+                    CultureInfo.InvariantCulture,
+                    "⚠ 强干扰 · 重传 {0:0.0}%",
+                    snap.WindowLossRatePercent);
+                linkQualityLabel.ForeColor = UiTheme.Danger;
+            }
+            else if (snap.IsDegraded)
+            {
+                linkQualityLabel.Text = String.Format(
+                    CultureInfo.InvariantCulture,
+                    "⚠ 链路 {0:0.0} ms · 重传 {1:0.0}%",
+                    snap.LastRttMs,
+                    snap.WindowLossRatePercent);
+                linkQualityLabel.ForeColor = UiTheme.Warning;
+            }
+            else
+            {
+                linkQualityLabel.Text = String.Format(
+                    CultureInfo.InvariantCulture,
+                    "链路 {0:0.0} ms · 重传 {1:0.0}%",
+                    snap.LastRttMs,
+                    snap.WindowLossRatePercent);
+                linkQualityLabel.ForeColor = UiTheme.Muted;
+            }
+        }
+
         private static Icon LoadAppIcon()
         {
             try
@@ -1016,7 +1102,9 @@ namespace ScaraArm.Console
                 CancelAllInFlightOps();
                 if (pollTimer != null) pollTimer.Dispose();
                 if (jogTimer != null) jogTimer.Dispose();
+                sc4iClient.DiagnosticEvent -= OnClientDiagnosticEvent;
                 sc4iClient.Dispose();
+                logger.Dispose();
                 if (appIcon != null) appIcon.Dispose();
                 theme.Dispose();
             }

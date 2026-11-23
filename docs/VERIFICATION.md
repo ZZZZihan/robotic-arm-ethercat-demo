@@ -91,3 +91,13 @@
 - **ThinkBook 四轴 SCARA 实机闭环验收**：
   - 使用现场 `scara-calibration.ini` 与 `scara-program.ini`（3 点位：启用 `P1 取料点 (360, 30, 105, R=0°)` 与 `P2 放料点 (360, -20, 105, R=0°)`，各停留 `400 ms`；禁用跳过点 `P_SKIP`；门型安全提 Z `120.0 mm`；速度 `0.35 圈/秒`；完后回零）。
   - 完整验证四轴使能（`EnMask=0xF, AuthMask=0xF`）→ 启动前预检 → 连续 2 轮门型循环取放（`P1 → P2 → P1 → P2`，重复定位 `360.00, ±20/30, 105.00–105.01 mm, R=0.00°`）与收尾 1 轮取放 + 完整回安全零点：`LIVE_TASK_PASS`（`Elapsed=84.13s, ProgressEvents=594, DwellHeartbeats=6, MaxPdoAge=0ms, LatchedFault=0x0, Estop=0, DrvErr=[0x0000×4]`），最终精准归位至 `X=395.00 mm, Y=0.00 mm, Z=108.01 mm, R=0.00°`。
+
+## 实机抓包取证与通信/重连体验加固（2026-11-23，ThinkBook 现场）
+
+- **现场 `pktmon` 抓包与只读遥测取证（`以太网 3` Realtek USB GbE）**：
+  - 静态持力只读采样 150 包 UDP（50 ms 间隔）与 30 包 ICMP 均为 **0% 丢包**（UDP RTT 中位 `2.48 ms`、`max 9.69 ms`），但控制卡内残留 `latched_fault = 0x30`（上次关闭控制台停止心跳超过 `1000 ms` 触发看门狗快停持力）。
+  - 复现演示全过程 `pktmon` 抓包（`demo-20261123-124749.pcapng`，`146.29 s` / `2,021` 包 / `0` Windows 协议栈丢包）：成功回包 RTT 中位 `2.38 ms`、`P99 3.95 ms`、`max 5.52 ms`、EtherCAT `pdo_age = 0 ms`、四轴 `DrvErr = 0x0000`；但机械臂运动及强电 EMI 窗口突发丢包率飙升至 **`25%–31%`**，曾在 `12:55:15` 出现 **连续 7 包心跳丢失（跨度 ~850 ms）**，打穿原 `120 ms × 6` 重试触发超时报错。
+- **三项独立 PR 修复与验证**：
+  - **PR #2（高丢包抗干扰加固）**：收紧各子命令单次等待时间并加密重试（`Heartbeat 45 ms × 14`、`StopHold 60 ms × 12`、`EnableAxes/FaultReset 80 ms × 8` 等，均控制在 `1000 ms` 看门狗内），为 `StartJogAsync`（`JogAxis`）与 `AcquireSession` 补齐防重放/会话重连重试，笛卡尔到达轮询容忍单次瞬时超时并动态放宽长程低速步长超时，超时中止时自动补发 `StopHoldAsync` 安全停机。
+  - **PR #3（断开提醒与 `0x30` 持力保护一键恢复）**：存在使能持力轴时关闭或断开前弹出确认提示；重连识别“纯 `0x30` 安全持力保护且四轴 `DrvErr=0`、无急停”时与真实硬件报警区分显示，提供显式 **`恢复持力`** 一键解除锁存并重新授权。
+  - **本轮通信诊断与落盘日志**：新增 `Sc4iLinkQualityTracker` 100 次滚动窗口统计与 `DiagnosticEvent`、`ConsoleDiagnosticLogger`（每日 UTF-8 落盘至 `logs\scara-YYYYMMDD.log`，自动记录命令/重试/超时/锁存变化，离线冒烟测试自动关闭文件写入）及底部实时链路质量指示（正常/5% 降级预警/15% 强干扰告警），并新增对应离线回环单测验证（共 **198 项**离线断言全通过：`protocol=40, client=42, scara=49, planner=27, tasks=40`）。
