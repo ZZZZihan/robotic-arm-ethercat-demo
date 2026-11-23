@@ -74,6 +74,10 @@ namespace ScaraArm.Console
             sessionLost = false;
             heartbeatFailCount = 0;
             SetStatus("正在连接控制卡…", UiTheme.Accent);
+            logger.LogInfo("CONN", String.Format(
+                CultureInfo.InvariantCulture,
+                "正在连接 {0}:{1} -> {2}:{3}",
+                endpoint.LocalIp, endpoint.LocalPort, endpoint.CardIp, endpoint.CardPort));
             RefreshUi();
             try
             {
@@ -84,6 +88,7 @@ namespace ScaraArm.Console
                 if (!liveStatus.BusReady)
                 {
                     SetStatus("已连接，正在初始化总线（电机不上使能）…", UiTheme.Accent);
+                    logger.LogInfo("CONN", "控制卡未进 OP，开始扫描从站并初始化总线…");
                     liveStatus = await RunCancellablePhaseAsync(30000, ct => sc4iClient.InitBusToOpAsync(ct));
                     if (IsDisposed || Disposing) return;
                 }
@@ -97,10 +102,15 @@ namespace ScaraArm.Console
                     : liveStatus.EnabledMask == 0
                         ? "已连接，总线就绪（电机未使能）。"
                         : "已连接，总线就绪（已有轴处于使能/持力状态）。";
+                logger.LogInfo("CONN", String.Format(
+                    CultureInfo.InvariantCulture,
+                    "连接就绪: busReady={0} en=0x{1:X} auth=0x{2:X} lat=0x{3:X2} pdoAge={4}ms",
+                    liveStatus.BusReady ? 1 : 0, liveStatus.EnabledMask, liveStatus.AuthorizedMask, liveStatus.LatchedFault, liveStatus.PdoAgeMs));
                 SetStatus(readyMsg, holdOnly ? UiTheme.Warning : UiTheme.Success);
             }
             catch (Exception error)
             {
+                logger.LogError("CONN", "连接或总线初始化失败：" + error.Message);
                 sc4iClient.Disconnect();
                 liveStatus = null;
                 sessionLost = false;
@@ -119,6 +129,7 @@ namespace ScaraArm.Console
 
         private async Task DisconnectAsync()
         {
+            logger.LogInfo("CONN", "断开控制卡连接。");
             busy = true;
             pollTimer.Stop();
             jogTimer.Stop();
@@ -209,6 +220,7 @@ namespace ScaraArm.Console
             {
                 if (!formClosing && !IsDisposed && !Disposing && sc4iClient.IsConnected && ReferenceEquals(activeOpCts, cts))
                 {
+                    logger.LogError("CMD", timeoutMessage);
                     if (stopHoldOnTimeout) await BestEffortStopHoldAsync();
                     if (!formClosing && !IsDisposed && !Disposing)
                         SetStatus(timeoutMessage, UiTheme.Danger);
@@ -216,18 +228,21 @@ namespace ScaraArm.Console
             }
             catch (Sc4iCommandException error)
             {
+                logger.LogError("CMD", error.Message);
                 liveStatus = error.Status;
                 HandleSessionErrorIfNeeded(error);
                 if (!IsDisposed && !Disposing && !sessionLost) SetStatus(error.Message, UiTheme.Danger);
             }
             catch (TimeoutException error)
             {
+                logger.LogError("CMD", failurePrefix + error.Message);
                 if (stopHoldOnTimeout && !formClosing && sc4iClient.IsConnected)
                     await BestEffortStopHoldAsync();
                 if (!IsDisposed && !Disposing) SetStatus(failurePrefix + error.Message, UiTheme.Danger);
             }
             catch (Exception error)
             {
+                logger.LogError("CMD", failurePrefix + error.Message);
                 if (!IsDisposed && !Disposing) SetStatus(failurePrefix + error.Message, UiTheme.Danger);
             }
             finally
@@ -440,6 +455,10 @@ namespace ScaraArm.Console
             activeTaskWaypointIndex = -1;
             activeTaskProgressText = startMessage;
             SetStatus(startMessage, UiTheme.Accent);
+            logger.LogInfo("TASK", String.Format(
+                CultureInfo.InvariantCulture,
+                "启动任务“{0}”：single={1} cycles={2} activeWaypoints={3}",
+                programToRun.Name, singleWaypointMode ? 1 : 0, programToRun.RepeatCycles, validation.ActiveWaypointCount));
             RefreshUi();
 
             CancellationTokenSource cts = new CancellationTokenSource();
@@ -468,6 +487,7 @@ namespace ScaraArm.Console
                             "循环任务已完成：共执行 {0} 轮（{1} 个点位）。",
                             result != null ? result.CompletedCycles : 0,
                             result != null ? result.ExecutedWaypoints : 0);
+                    logger.LogInfo("TASK", doneMsg);
                     SetStatus(doneMsg, UiTheme.Success);
                 }
             }
@@ -475,6 +495,7 @@ namespace ScaraArm.Console
             {
                 if (!formClosing && !IsDisposed && !Disposing && sc4iClient.IsConnected && ReferenceEquals(activeOpCts, cts))
                 {
+                    logger.LogWarning("TASK", "任务被取消或停止。");
                     await BestEffortStopHoldAsync();
                     if (!formClosing && !IsDisposed && !Disposing)
                         SetStatus("任务已停止。", UiTheme.Accent);
@@ -482,18 +503,21 @@ namespace ScaraArm.Console
             }
             catch (Sc4iCommandException error)
             {
+                logger.LogError("TASK", error.Message);
                 liveStatus = error.Status;
                 HandleSessionErrorIfNeeded(error);
                 if (!IsDisposed && !Disposing && !sessionLost) SetStatus(error.Message, UiTheme.Danger);
             }
             catch (TimeoutException error)
             {
+                logger.LogError("TASK", "任务执行超时：" + error.Message);
                 if (!formClosing && sc4iClient.IsConnected)
                     await BestEffortStopHoldAsync();
                 if (!IsDisposed && !Disposing) SetStatus("任务执行超时，已请求停止保持：" + error.Message, UiTheme.Danger);
             }
             catch (Exception error)
             {
+                logger.LogError("TASK", "任务执行失败：" + error.Message);
                 if (!IsDisposed && !Disposing) SetStatus("任务执行失败：" + error.Message, UiTheme.Danger);
             }
             finally
@@ -666,6 +690,7 @@ namespace ScaraArm.Console
         private async Task TriggerStopHoldAsync(string message)
         {
             if (!sc4iClient.IsConnected) return;
+            logger.LogWarning("SAFETY", "触发停止保持：" + message);
             jogTimer.Stop();
             jogActive = false;
             jogGeneration++;
@@ -715,7 +740,12 @@ namespace ScaraArm.Console
                 liveStatus = reply;
                 bool recovered = heartbeatFailCount > 0;
                 heartbeatFailCount = 0;
-                if (recovered) SetStatus("通信已恢复。", UiTheme.Success);
+                if (recovered)
+                {
+                    logger.LogInfo("LINK", "心跳通信已恢复。");
+                    SetStatus("通信已恢复。", UiTheme.Success);
+                }
+                logger.LogLinkSummaryIfDue(sc4iClient.GetLinkQualitySnapshot(), TimeSpan.FromSeconds(30));
                 RefreshUi();
             }
             catch (OperationCanceledException)
@@ -723,7 +753,11 @@ namespace ScaraArm.Console
                 if (IsDisposed || Disposing || !sc4iClient.IsConnected || busy || jogActive) return;
                 if (!ReferenceEquals(pollCts, cts)) return;
                 heartbeatFailCount++;
-                if (heartbeatFailCount == 1) SetStatus("通信超时，正在等待恢复…", UiTheme.Danger);
+                if (heartbeatFailCount == 1)
+                {
+                    logger.LogWarning("LINK", "心跳轮询超时（>800 ms），正在等待恢复。");
+                    SetStatus("通信超时，正在等待恢复…", UiTheme.Danger);
+                }
                 RefreshUi();
             }
             catch (Sc4iCommandException error)
@@ -737,15 +771,23 @@ namespace ScaraArm.Console
                 else
                 {
                     heartbeatFailCount++;
-                    if (heartbeatFailCount == 1) SetStatus(error.Message, UiTheme.Danger);
+                    if (heartbeatFailCount == 1)
+                    {
+                        logger.LogWarning("LINK", "心跳命令返回错误：" + error.Message);
+                        SetStatus(error.Message, UiTheme.Danger);
+                    }
                 }
                 RefreshUi();
             }
-            catch
+            catch (Exception error)
             {
                 if (IsDisposed || Disposing || !sc4iClient.IsConnected) return;
                 heartbeatFailCount++;
-                if (heartbeatFailCount == 1) SetStatus("通信超时，正在等待恢复…", UiTheme.Danger);
+                if (heartbeatFailCount == 1)
+                {
+                    logger.LogWarning("LINK", "心跳通信异常：" + error.Message);
+                    SetStatus("通信超时，正在等待恢复…", UiTheme.Danger);
+                }
                 RefreshUi();
             }
             finally
@@ -764,6 +806,7 @@ namespace ScaraArm.Console
 
         private void MarkSessionLost()
         {
+            logger.LogError("CONN", "会话失效或控制卡已重启。");
             sessionLost = true;
             pollTimer.Stop();
             jogTimer.Stop();

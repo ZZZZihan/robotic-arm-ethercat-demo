@@ -125,14 +125,38 @@ namespace ScaraArm.Core.Transport
             CancellationToken ct,
             Func<byte[], T> parser)
         {
+            int unused;
+            return ExchangeValidatedWithRetry(
+                request,
+                expectedLength,
+                overallTimeoutMs,
+                perAttemptTimeoutMs,
+                maxAttempts,
+                ct,
+                parser,
+                out unused);
+        }
+
+        public T ExchangeValidatedWithRetry<T>(
+            byte[] request,
+            int expectedLength,
+            int overallTimeoutMs,
+            int perAttemptTimeoutMs,
+            int maxAttempts,
+            CancellationToken ct,
+            Func<byte[], T> parser,
+            out int attemptsUsed)
+        {
             Stopwatch overall = Stopwatch.StartNew();
             TimeoutException lastTimeout = null;
+            attemptsUsed = 0;
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
                 int remaining = overallTimeoutMs - (int)overall.ElapsedMilliseconds;
                 if (remaining <= 0) break;
                 int attemptTimeout = Math.Min(perAttemptTimeoutMs, remaining);
                 if (attemptTimeout < 30 && attempt > 0) break;
+                attemptsUsed = attempt + 1;
                 try
                 {
                     return ExchangeValidated(request, expectedLength, attemptTimeout, ct, parser);

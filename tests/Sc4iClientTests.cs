@@ -487,6 +487,41 @@ namespace ScaraArm.Tests
                 t.Check(client.IsConnected && reconnectedAfterDrop.ErrorCode == 0u && dropNextAcquireRequestCount == 0,
                     "ConnectAsync (AcquireSession) recovered from 1 dropped request packet");
 
+                // Diagnostics: track link quality retries, RTT, timeouts, DiagnosticEvent, and reset on Disconnect
+                int diagEventCount = 0;
+                int diagRetryEvents = 0;
+                int diagTimeoutEvents = 0;
+                Action<Sc4iTransportEvent> diagHandler = ev =>
+                {
+                    if (ev == null) return;
+                    diagEventCount++;
+                    if (ev.Succeeded && ev.Attempts > 1) diagRetryEvents++;
+                    if (!ev.Succeeded) diagTimeoutEvents++;
+                };
+                client.DiagnosticEvent += diagHandler;
+                try
+                {
+                    for (int i = 0; i < 4; i++)
+                        await client.SendHeartbeatAsync(CancellationToken.None).ConfigureAwait(false);
+                    dropRepliesCount = 3;
+                    await client.SendHeartbeatAsync(CancellationToken.None).ConfigureAwait(false);
+                    dropRepliesCount = 6;
+                    t.Throws<TimeoutException>(() =>
+                        client.SendJogKeepaliveAsync(CancellationToken.None).GetAwaiter().GetResult(),
+                        "JogKeepalive times out after 6 consecutive dropped replies");
+
+                    Sc4iLinkQualitySnapshot snap = client.GetLinkQualitySnapshot();
+                    t.Check(diagEventCount >= 6 && diagRetryEvents >= 1 && diagTimeoutEvents == 1,
+                        "DiagnosticEvent reported normal, retry, and timeout exchanges");
+                    t.Check(snap.TotalExchanges >= 6 && snap.TotalRetries >= 8 && snap.TotalTimeouts == 1
+                        && snap.WindowLossRatePercent > 5.0 && snap.LastRttMs >= 0.0,
+                        "GetLinkQualitySnapshot recorded exchanges, retries, timeouts, and loss rate");
+                }
+                finally
+                {
+                    client.DiagnosticEvent -= diagHandler;
+                }
+
                 dropRepliesCount = 30;
                 Task<Sc4iStatusReply> stalled = client.SendHeartbeatAsync(CancellationToken.None);
                 await Task.Delay(80).ConfigureAwait(false);
@@ -494,6 +529,8 @@ namespace ScaraArm.Tests
                 client.Disconnect();
                 sw.Stop();
                 t.Check(sw.ElapsedMilliseconds < 1000, "Disconnect preempted stalled request promptly");
+                t.Check(client.GetLinkQualitySnapshot().TotalExchanges == 0,
+                    "Disconnect reset link quality window cleanly");
                 bool cancelledOrFailed = false;
                 try { await stalled.ConfigureAwait(false); }
                 catch (OperationCanceledException) { cancelledOrFailed = true; }

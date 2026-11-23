@@ -24,6 +24,7 @@ namespace ScaraArm.Core.Transport
         private readonly SemaphoreSlim gate = new SemaphoreSlim(1, 1);
         private readonly object stateLock = new object();
         private readonly CancellationTokenSource disposeCts = new CancellationTokenSource();
+        private readonly Sc4iLinkQualityTracker linkTracker = new Sc4iLinkQualityTracker();
         private UdpFrameChannel channel;
         private CancellationTokenSource sessionCts;
         private int defaultTimeoutMs = 2000;
@@ -58,6 +59,13 @@ namespace ScaraArm.Core.Transport
 
         public double CountsPerRevolution { get { return Sc4iMachineConfig.DefaultCountsPerRevolution; } }
 
+        public event Action<Sc4iTransportEvent> DiagnosticEvent;
+
+        public Sc4iLinkQualitySnapshot GetLinkQualitySnapshot()
+        {
+            return linkTracker.Snapshot();
+        }
+
         public Task<Sc4iStatusReply> ConnectAsync(
             string localIp, int localPort, string cardIp, int cardPort, int timeoutMs, CancellationToken cancellationToken)
         {
@@ -78,6 +86,7 @@ namespace ScaraArm.Core.Transport
                     {
                         ThrowIfDisposed();
                         CloseChannelInternal();
+                        linkTracker.Reset();
 
                         UdpFrameChannel candidate = UdpFrameChannel.Open(localIp, localPort, cardIp, cardPort);
                         try
@@ -86,9 +95,28 @@ namespace ScaraArm.Core.Transport
                             if (helloToken == 0) helloToken = 1;
                             byte expectedToken = helloToken;
                             byte[] helloReq = Sc4iProtocol.BuildHelloRequest(expectedToken);
-                            Sc4iHelloReply hello = candidate.ExchangeValidatedWithRetry(
-                                helloReq, Sc4iProtocol.HelloReplyLength, timeoutMs, 250, 4, ct,
-                                raw => Sc4iProtocol.ParseHelloReply(raw, expectedToken));
+                            int helloAttempts = 0;
+                            Stopwatch helloSw = Stopwatch.StartNew();
+                            Sc4iHelloReply hello;
+                            try
+                            {
+                                hello = candidate.ExchangeValidatedWithRetry(
+                                    helloReq, Sc4iProtocol.HelloReplyLength, timeoutMs, 250, 4, ct,
+                                    raw => Sc4iProtocol.ParseHelloReply(raw, expectedToken),
+                                    out helloAttempts);
+                                helloSw.Stop();
+                                RecordAndEmitExchange(
+                                    0x01, Sc4iSubcmd.Snapshot, "Hello", expectedToken,
+                                    helloAttempts, true, helloSw.Elapsed.TotalMilliseconds, null, null);
+                            }
+                            catch (TimeoutException)
+                            {
+                                helloSw.Stop();
+                                RecordAndEmitExchange(
+                                    0x01, Sc4iSubcmd.Snapshot, "Hello", expectedToken,
+                                    helloAttempts > 0 ? helloAttempts : 4, false, helloSw.Elapsed.TotalMilliseconds, null, "超时");
+                                throw;
+                            }
 
                             // Pure read-only snapshot first to inspect existing bus & session state.
                             Sc4iStatusReply snap = SendF2OnChannelWithRetry(
@@ -499,6 +527,8 @@ namespace ScaraArm.Core.Transport
 
             Stopwatch overall = Stopwatch.StartNew();
             TimeoutException lastTimeout = null;
+            int attemptsUsed = 0;
+            uint lastAttemptSeq = 0;
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
                 int remaining = timeoutMs - (int)overall.ElapsedMilliseconds;
@@ -509,26 +539,43 @@ namespace ScaraArm.Core.Transport
                 uint seq = nextSeq++;
                 if (seq == 0) seq = nextSeq++;
                 if (seq > maxUsedSeq) maxUsedSeq = seq;
+                lastAttemptSeq = seq;
+                attemptsUsed = attempt + 1;
+                Stopwatch attemptSw = Stopwatch.StartNew();
                 try
                 {
                     Sc4iStatusReply reply = SendF2OnChannel(channel, subcmd, arg, seq, bootId, sessionId, payload, attemptTimeout, ct);
+                    attemptSw.Stop();
                     lock (stateLock)
                     {
                         lastStatus = reply;
                     }
+                    RecordAndEmitExchange(
+                        0xF2, subcmd, subcmd.ToString(), seq,
+                        attemptsUsed, true, attemptSw.Elapsed.TotalMilliseconds, reply, null);
                     return reply;
                 }
                 catch (TimeoutException ex)
                 {
                     lastTimeout = ex;
                     if (attempt + 1 >= maxAttempts || ct.IsCancellationRequested)
+                    {
+                        overall.Stop();
+                        RecordAndEmitExchange(
+                            0xF2, subcmd, subcmd.ToString(), seq,
+                            attemptsUsed, false, overall.Elapsed.TotalMilliseconds, null, "超时");
                         throw;
+                    }
                 }
             }
+            overall.Stop();
+            RecordAndEmitExchange(
+                0xF2, subcmd, subcmd.ToString(), lastAttemptSeq,
+                attemptsUsed > 0 ? attemptsUsed : 1, false, overall.Elapsed.TotalMilliseconds, null, "超时");
             throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。");
         }
 
-        private static Sc4iStatusReply SendAcquireSessionWithRetry(
+        private Sc4iStatusReply SendAcquireSessionWithRetry(
             UdpFrameChannel candidate, uint startSeq, ulong cardBootId, ulong sid,
             int timeoutMs, CancellationToken ct, out uint finalSeq)
         {
@@ -537,6 +584,7 @@ namespace ScaraArm.Core.Transport
             const int perAttemptTimeoutMs = 100;
             Stopwatch overall = Stopwatch.StartNew();
             TimeoutException lastTimeout = null;
+            int attemptsUsed = 0;
 
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
@@ -545,12 +593,18 @@ namespace ScaraArm.Core.Transport
                 int attemptTimeout = Math.Min(perAttemptTimeoutMs, remaining);
                 if (attemptTimeout < 30 && attempt > 0) break;
 
+                attemptsUsed = attempt + 1;
+                Stopwatch attemptSw = Stopwatch.StartNew();
                 try
                 {
                     Sc4iStatusReply reply = SendF2OnChannel(
                         candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, sid, null, attemptTimeout, ct);
+                    attemptSw.Stop();
                     if (attempt > 0 && reply.ErrorCode == 0x35u && reply.SessionId == sid)
                     {
+                        RecordAndEmitExchange(
+                            0xF2, Sc4iSubcmd.AcquireSession, "AcquireSession", startSeq,
+                            attemptsUsed, true, attemptSw.Elapsed.TotalMilliseconds, reply, "0x35 校验首包");
                         uint confirmSeq = startSeq + 1u;
                         if (confirmSeq == 0) confirmSeq = 1u;
                         Sc4iStatusReply hb = SendF2OnChannelWithRetry(
@@ -563,16 +617,29 @@ namespace ScaraArm.Core.Transport
                         }
                         return reply;
                     }
+                    RecordAndEmitExchange(
+                        0xF2, Sc4iSubcmd.AcquireSession, "AcquireSession", startSeq,
+                        attemptsUsed, true, attemptSw.Elapsed.TotalMilliseconds, reply, null);
                     return reply;
                 }
                 catch (TimeoutException ex)
                 {
                     lastTimeout = ex;
                     if (attempt + 1 >= maxAttempts || ct.IsCancellationRequested)
+                    {
+                        overall.Stop();
+                        RecordAndEmitExchange(
+                            0xF2, Sc4iSubcmd.AcquireSession, "AcquireSession", startSeq,
+                            attemptsUsed, false, overall.Elapsed.TotalMilliseconds, null, "超时");
                         throw;
+                    }
                 }
             }
 
+            overall.Stop();
+            RecordAndEmitExchange(
+                0xF2, Sc4iSubcmd.AcquireSession, "AcquireSession", startSeq,
+                attemptsUsed > 0 ? attemptsUsed : 1, false, overall.Elapsed.TotalMilliseconds, null, "超时");
             throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。");
         }
 
@@ -587,6 +654,7 @@ namespace ScaraArm.Core.Transport
 
             Stopwatch overall = Stopwatch.StartNew();
             TimeoutException lastTimeout = null;
+            int attemptsUsed = 0;
 
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
@@ -595,30 +663,49 @@ namespace ScaraArm.Core.Transport
                 int attemptTimeout = Math.Min(perAttemptTimeoutMs, remaining);
                 if (attemptTimeout < 30 && attempt > 0) break;
 
+                attemptsUsed = attempt + 1;
+                Stopwatch attemptSw = Stopwatch.StartNew();
                 try
                 {
                     Sc4iStatusReply reply = SendF2OnChannel(
                         channel, subcmd, arg, seq, bootId, sessionId, payload, attemptTimeout, ct);
+                    attemptSw.Stop();
                     if (attempt > 0 && reply.ErrorCode == 0x35u)
                     {
                         // The first packet was accepted by the card and only its reply was lost.
                         // Fetch fresh live status via Heartbeat so callers observe actual motion/safety state.
+                        RecordAndEmitExchange(
+                            0xF2, subcmd, subcmd.ToString(), seq,
+                            attemptsUsed, true, attemptSw.Elapsed.TotalMilliseconds, reply, "0x35 确认首包已生效");
                         return SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
                     }
                     lock (stateLock)
                     {
                         lastStatus = reply;
                     }
+                    RecordAndEmitExchange(
+                        0xF2, subcmd, subcmd.ToString(), seq,
+                        attemptsUsed, true, attemptSw.Elapsed.TotalMilliseconds, reply, null);
                     return reply;
                 }
                 catch (TimeoutException ex)
                 {
                     lastTimeout = ex;
                     if (attempt + 1 >= maxAttempts || ct.IsCancellationRequested)
+                    {
+                        overall.Stop();
+                        RecordAndEmitExchange(
+                            0xF2, subcmd, subcmd.ToString(), seq,
+                            attemptsUsed, false, overall.Elapsed.TotalMilliseconds, null, "超时");
                         throw;
+                    }
                 }
             }
 
+            overall.Stop();
+            RecordAndEmitExchange(
+                0xF2, subcmd, subcmd.ToString(), seq,
+                attemptsUsed > 0 ? attemptsUsed : 1, false, overall.Elapsed.TotalMilliseconds, null, "超时");
             throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。");
         }
 
@@ -658,14 +745,70 @@ namespace ScaraArm.Core.Transport
             }
         }
 
-        private static Sc4iStatusReply SendF2OnChannelWithRetry(
+        private Sc4iStatusReply SendF2OnChannelWithRetry(
             UdpFrameChannel targetChannel, Sc4iSubcmd subcmd, byte arg, uint seq, ulong bootIdVal, ulong sessionIdVal,
             byte[] payload, int overallTimeoutMs, int perAttemptTimeoutMs, int maxAttempts, CancellationToken ct)
         {
             byte[] req = Sc4iProtocol.BuildF2Request(subcmd, arg, seq, bootIdVal, sessionIdVal, payload);
-            return targetChannel.ExchangeValidatedWithRetry(
-                req, Sc4iProtocol.F2ReplyLength, overallTimeoutMs, perAttemptTimeoutMs, maxAttempts, ct,
-                raw => ParseAndValidateF2Reply(raw, subcmd, seq));
+            int attempts = 0;
+            Stopwatch sw = Stopwatch.StartNew();
+            try
+            {
+                Sc4iStatusReply reply = targetChannel.ExchangeValidatedWithRetry(
+                    req, Sc4iProtocol.F2ReplyLength, overallTimeoutMs, perAttemptTimeoutMs, maxAttempts, ct,
+                    raw => ParseAndValidateF2Reply(raw, subcmd, seq),
+                    out attempts);
+                sw.Stop();
+                RecordAndEmitExchange(
+                    0xF2, subcmd, subcmd.ToString(), seq,
+                    attempts, true, sw.Elapsed.TotalMilliseconds, reply, null);
+                return reply;
+            }
+            catch (TimeoutException)
+            {
+                sw.Stop();
+                RecordAndEmitExchange(
+                    0xF2, subcmd, subcmd.ToString(), seq,
+                    attempts > 0 ? attempts : maxAttempts, false, sw.Elapsed.TotalMilliseconds, null, "超时");
+                throw;
+            }
+        }
+
+        private void RecordAndEmitExchange(
+            byte commandCode,
+            Sc4iSubcmd subcmd,
+            string subcommandName,
+            uint seq,
+            int attempts,
+            bool succeeded,
+            double rttMs,
+            Sc4iStatusReply reply,
+            string note)
+        {
+            linkTracker.RecordExchange(attempts, succeeded, rttMs);
+            Action<Sc4iTransportEvent> handler = DiagnosticEvent;
+            if (handler != null)
+            {
+                try
+                {
+                    handler(new Sc4iTransportEvent
+                    {
+                        TimestampUtc = DateTime.UtcNow,
+                        CommandCode = commandCode,
+                        Subcmd = subcmd,
+                        SubcommandName = subcommandName ?? subcmd.ToString(),
+                        Seq = seq,
+                        Attempts = attempts > 0 ? attempts : 1,
+                        Succeeded = succeeded,
+                        RttMs = rttMs,
+                        ErrorCode = reply != null ? reply.ErrorCode : 0u,
+                        LatchedFault = reply != null ? reply.LatchedFault : 0u,
+                        PdoAgeMs = reply != null ? reply.PdoAgeMs : 0u,
+                        Note = note
+                    });
+                }
+                catch { }
+            }
         }
 
         private static Sc4iStatusReply SendF2OnChannel(
@@ -801,6 +944,7 @@ namespace ScaraArm.Core.Transport
                 try { oldCts.Dispose(); } catch { }
             }
             if (oldChannel != null) oldChannel.Dispose();
+            linkTracker.Reset();
         }
 
         private void ThrowIfDisposed()
