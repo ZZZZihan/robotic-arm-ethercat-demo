@@ -148,13 +148,25 @@ namespace ScaraArm.Console
             }
         }
 
-        private async Task RunExclusiveCommandAsync(
+        private Task RunExclusiveCommandAsync(
             string startMessage,
             int timeoutMs,
             Func<CancellationToken, Task<Sc4iStatusReply>> command,
             Action<Sc4iStatusReply> onSuccess,
             string timeoutMessage,
             string failurePrefix)
+        {
+            return RunExclusiveCommandAsync(startMessage, timeoutMs, command, onSuccess, timeoutMessage, failurePrefix, false);
+        }
+
+        private async Task RunExclusiveCommandAsync(
+            string startMessage,
+            int timeoutMs,
+            Func<CancellationToken, Task<Sc4iStatusReply>> command,
+            Action<Sc4iStatusReply> onSuccess,
+            string timeoutMessage,
+            string failurePrefix,
+            bool stopHoldOnTimeout)
         {
             if (busy || jogActive || sessionLost || !sc4iClient.IsConnected) return;
             busy = true;
@@ -173,13 +185,23 @@ namespace ScaraArm.Console
             catch (OperationCanceledException)
             {
                 if (!formClosing && !IsDisposed && !Disposing && sc4iClient.IsConnected && ReferenceEquals(activeOpCts, cts))
-                    SetStatus(timeoutMessage, UiTheme.Danger);
+                {
+                    if (stopHoldOnTimeout) await BestEffortStopHoldAsync();
+                    if (!formClosing && !IsDisposed && !Disposing)
+                        SetStatus(timeoutMessage, UiTheme.Danger);
+                }
             }
             catch (Sc4iCommandException error)
             {
                 liveStatus = error.Status;
                 HandleSessionErrorIfNeeded(error);
                 if (!IsDisposed && !Disposing && !sessionLost) SetStatus(error.Message, UiTheme.Danger);
+            }
+            catch (TimeoutException error)
+            {
+                if (stopHoldOnTimeout && !formClosing && sc4iClient.IsConnected)
+                    await BestEffortStopHoldAsync();
+                if (!IsDisposed && !Disposing) SetStatus(failurePrefix + error.Message, UiTheme.Danger);
             }
             catch (Exception error)
             {
@@ -285,10 +307,11 @@ namespace ScaraArm.Console
 
             double vel = cartesianPanel.VelocityRevPerSec;
             string actionLabel = target.Label ?? "笛卡尔运动";
+            int overallTimeoutMs = ComputePlanTimeoutMs(plan, vel, DefaultAccelerationRevPerSec2);
 
             await RunExclusiveCommandAsync(
                 "正在执行 " + actionLabel + "…",
-                45000,
+                overallTimeoutMs,
                 ct => CartesianMotionPlanner.ExecutePlanAsync(
                     sc4iClient,
                     plan,
@@ -303,7 +326,8 @@ namespace ScaraArm.Console
                     SetStatus(actionLabel + " 已到位。", UiTheme.Success);
                 },
                 "笛卡尔运动已中止或超时。",
-                "笛卡尔运动失败：");
+                "笛卡尔运动失败：",
+                true);
         }
 
         private void OnCartesianProgress(CartesianStepProgress progress)
@@ -411,13 +435,23 @@ namespace ScaraArm.Console
             catch (OperationCanceledException)
             {
                 if (!formClosing && !IsDisposed && !Disposing && sc4iClient.IsConnected && ReferenceEquals(activeOpCts, cts))
-                    SetStatus("任务已停止。", UiTheme.Accent);
+                {
+                    await BestEffortStopHoldAsync();
+                    if (!formClosing && !IsDisposed && !Disposing)
+                        SetStatus("任务已停止。", UiTheme.Accent);
+                }
             }
             catch (Sc4iCommandException error)
             {
                 liveStatus = error.Status;
                 HandleSessionErrorIfNeeded(error);
                 if (!IsDisposed && !Disposing && !sessionLost) SetStatus(error.Message, UiTheme.Danger);
+            }
+            catch (TimeoutException error)
+            {
+                if (!formClosing && sc4iClient.IsConnected)
+                    await BestEffortStopHoldAsync();
+                if (!IsDisposed && !Disposing) SetStatus("任务执行超时，已请求停止保持：" + error.Message, UiTheme.Danger);
             }
             catch (Exception error)
             {
@@ -528,7 +562,7 @@ namespace ScaraArm.Console
             if (!jogActive || jogKeepaliveInFlight || sessionLost || !sc4iClient.IsConnected) return;
             jogKeepaliveInFlight = true;
             int myGen = jogGeneration;
-            CancellationTokenSource cts = new CancellationTokenSource(280);
+            CancellationTokenSource cts = new CancellationTokenSource(420);
             CancelAndDisposeCts(ref jogCts);
             jogCts = cts;
             try
@@ -632,7 +666,7 @@ namespace ScaraArm.Console
         {
             if (!sc4iClient.IsConnected || pollInFlight || busy || jogActive || sessionLost) return;
             pollInFlight = true;
-            CancellationTokenSource cts = new CancellationTokenSource(650);
+            CancellationTokenSource cts = new CancellationTokenSource(800);
             CancelAndDisposeCts(ref pollCts);
             pollCts = cts;
             try
@@ -716,6 +750,34 @@ namespace ScaraArm.Console
             CancelAndDisposeCts(ref pollCts);
             CancelAndDisposeCts(ref jogCts);
             CancelAndDisposeCts(ref activeOpCts);
+        }
+
+        private async Task BestEffortStopHoldAsync()
+        {
+            if (!sc4iClient.IsConnected || formClosing) return;
+            try
+            {
+                using (CancellationTokenSource stopCts = new CancellationTokenSource(1500))
+                {
+                    Sc4iStatusReply reply = await sc4iClient.StopHoldAsync(stopCts.Token);
+                    if (reply != null && !IsDisposed && !Disposing)
+                        liveStatus = reply;
+                }
+            }
+            catch { }
+        }
+
+        private static int ComputePlanTimeoutMs(CartesianMovePlan plan, double velRevPerSec, double accRevPerSec2)
+        {
+            long totalMs = 15000;
+            if (plan != null && plan.Steps != null)
+            {
+                for (int i = 0; i < plan.Steps.Length; i++)
+                    totalMs += CartesianMotionPlanner.ComputeRecommendedStepTimeoutMs(plan.Steps[i].DeltaRev, velRevPerSec, accRevPerSec2);
+            }
+            if (totalMs < 45000) return 45000;
+            if (totalMs > 600000) return 600000;
+            return (int)totalMs;
         }
     }
 }

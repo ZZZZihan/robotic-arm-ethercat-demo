@@ -161,6 +161,23 @@ namespace ScaraArm.Core.Motion
             };
         }
 
+        public static int ComputeRecommendedStepTimeoutMs(
+            double deltaRev,
+            double velocityRevPerSec,
+            double accelerationRevPerSec2,
+            int minimumTimeoutMs = DefaultStepTimeoutMs)
+        {
+            double minFloor = minimumTimeoutMs > 0 ? minimumTimeoutMs : DefaultStepTimeoutMs;
+            double v = Math.Max(Math.Abs(velocityRevPerSec), 0.005);
+            double a = Math.Max(Math.Abs(accelerationRevPerSec2), 0.05);
+            double estimatedSec = Math.Abs(deltaRev) / v + 2.0 * v / a + 12.0;
+            double ms = estimatedSec * 1000.0;
+            if (Double.IsNaN(ms) || Double.IsInfinity(ms)) return 180000;
+            if (ms < minFloor) return (int)Math.Ceiling(minFloor);
+            if (ms > 180000.0) return 180000;
+            return (int)Math.Ceiling(ms);
+        }
+
         public static Task<Sc4iStatusReply> ExecutePlanAsync(
             ISc4iMotionClient client,
             CartesianMovePlan plan,
@@ -227,7 +244,11 @@ namespace ScaraArm.Core.Motion
                 ReportProgress(onProgress, i, plan.Steps.Length, step, latest, stepMessage);
                 if (!client.IsConnected) return latest;
 
-                DateTime stepDeadline = DateTime.UtcNow.AddMilliseconds(stepTimeoutMs);
+                int effectiveStepTimeoutMs = stepTimeoutMs == DefaultStepTimeoutMs
+                    ? ComputeRecommendedStepTimeoutMs(step.DeltaRev, velocityRevPerSec, accelerationRevPerSec2, stepTimeoutMs)
+                    : stepTimeoutMs;
+                DateTime stepDeadline = DateTime.UtcNow.AddMilliseconds(effectiveStepTimeoutMs);
+                int consecutiveTimeouts = 0;
                 while (true)
                 {
                     if (pollIntervalMs > 0)
@@ -235,7 +256,19 @@ namespace ScaraArm.Core.Motion
                     else
                         cancellationToken.ThrowIfCancellationRequested();
 
-                    latest = await client.SendHeartbeatAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        latest = await client.SendHeartbeatAsync(cancellationToken).ConfigureAwait(false);
+                        consecutiveTimeouts = 0;
+                    }
+                    catch (TimeoutException)
+                    {
+                        consecutiveTimeouts++;
+                        if (cancellationToken.IsCancellationRequested || consecutiveTimeouts >= 2 || DateTime.UtcNow > stepDeadline)
+                            throw;
+                        continue;
+                    }
+
                     ReportProgress(onProgress, i, plan.Steps.Length, step, latest, null);
                     if (!client.IsConnected) return latest;
 

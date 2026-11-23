@@ -147,8 +147,8 @@ namespace ScaraArm.Core.Transport
         {
             ulong newSid = GenerateSessionId();
             uint startSeq = 1;
-            Sc4iStatusReply acquired = SendF2OnChannel(
-                candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+            Sc4iStatusReply acquired = SendAcquireSessionWithRetry(
+                candidate, startSeq, cardBootId, newSid, timeoutMs, ct, out startSeq);
 
             if (acquired.ErrorCode == 0x36)
             {
@@ -158,8 +158,8 @@ namespace ScaraArm.Core.Transport
                     await Task.Delay(1150, ct).ConfigureAwait(false);
                     newSid = GenerateSessionId();
                     startSeq = 1;
-                    acquired = SendF2OnChannel(
-                        candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+                    acquired = SendAcquireSessionWithRetry(
+                        candidate, startSeq, cardBootId, newSid, timeoutMs, ct, out startSeq);
                 }
 
                 if (acquired.ErrorCode == 0x36 && snap.SessionId != 0)
@@ -167,8 +167,8 @@ namespace ScaraArm.Core.Transport
                     // Same host/port reconnect before bus init (or while holding session): resume active session with strictly monotonic seq.
                     newSid = snap.SessionId;
                     startSeq = ComputeRecoverySeq(snap.Seq, maxUsedSeq);
-                    acquired = SendF2OnChannel(
-                        candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+                    acquired = SendAcquireSessionWithRetry(
+                        candidate, startSeq, cardBootId, newSid, timeoutMs, ct, out startSeq);
 
                     uint[] replaySteps = { 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u };
                     for (int attempt = 0; acquired.ErrorCode == 0x35 && attempt < replaySteps.Length; attempt++)
@@ -181,8 +181,8 @@ namespace ScaraArm.Core.Transport
                         if (bumped <= startSeq)
                             break;
                         startSeq = (uint)bumped;
-                        acquired = SendF2OnChannel(
-                            candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, newSid, null, timeoutMs, ct);
+                        acquired = SendAcquireSessionWithRetry(
+                            candidate, startSeq, cardBootId, newSid, timeoutMs, ct, out startSeq);
                     }
                 }
             }
@@ -318,7 +318,8 @@ namespace ScaraArm.Core.Transport
                     throw new ArgumentOutOfRangeException("targetRev", "单轴目标位移 " + deltaRev.ToString("0.###") + " 圈超过安全上限 ±" + MaxSafeStepRev + " 圈。");
 
                 byte[] payload = Sc4iProtocol.BuildMoveAxisPtpPayload(targetRev, velRevPerSec, accRevPerSec2);
-                Sc4iStatusReply reply = SendMoveAxisPtpSameSeqWithRetry((byte)jointIndex, payload, 1500, ct);
+                Sc4iStatusReply reply = SendCommandSameSeqWithRetry(
+                    Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 1500, 70, 10, ct);
                 if (reply.ErrorCode != 0)
                     throw new Sc4iCommandException("轴 " + (jointIndex + 1) + " 绝对定位", reply);
                 return Task.FromResult(reply);
@@ -339,7 +340,8 @@ namespace ScaraArm.Core.Transport
                 double currentRev = status.Slaves[jointIndex].ActualRevolutions(CountsPerRevolution);
                 double targetRev = currentRev + deltaRev;
                 byte[] payload = Sc4iProtocol.BuildMoveAxisPtpPayload(targetRev, velRevPerSec, accRevPerSec2);
-                Sc4iStatusReply reply = SendMoveAxisPtpSameSeqWithRetry((byte)jointIndex, payload, 1500, ct);
+                Sc4iStatusReply reply = SendCommandSameSeqWithRetry(
+                    Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 1500, 70, 10, ct);
                 if (reply.ErrorCode != 0)
                     throw new Sc4iCommandException("轴 " + (jointIndex + 1) + " 相对定位", reply);
                 return Task.FromResult(reply);
@@ -352,7 +354,14 @@ namespace ScaraArm.Core.Transport
             if (Double.IsNaN(velRevPerSec) || Double.IsInfinity(velRevPerSec) || velRevPerSec == 0.0 || Math.Abs(velRevPerSec) > MaxSafeJogVelocityRevPerSec)
                 throw new ArgumentOutOfRangeException("velRevPerSec", "点动速度必须非零且不超过 ±" + MaxSafeJogVelocityRevPerSec + " rev/s。");
             byte[] payload = Sc4iProtocol.BuildJogPayload(velRevPerSec);
-            return ExecuteF2Async("轴 " + (jointIndex + 1) + " 点动", Sc4iSubcmd.JogAxis, (byte)jointIndex, payload, 2000, true, cancellationToken);
+            return RunConnectedAsync(cancellationToken, ct =>
+            {
+                Sc4iStatusReply reply = SendCommandSameSeqWithRetry(
+                    Sc4iSubcmd.JogAxis, (byte)jointIndex, payload, 2000, 70, 8, ct);
+                if (reply.ErrorCode != 0)
+                    throw new Sc4iCommandException("轴 " + (jointIndex + 1) + " 点动", reply);
+                return Task.FromResult(reply);
+            });
         }
 
         public Task<Sc4iStatusReply> SendJogKeepaliveAsync(CancellationToken cancellationToken)
@@ -480,16 +489,13 @@ namespace ScaraArm.Core.Transport
             throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。");
         }
 
-        private Sc4iStatusReply SendMoveAxisPtpSameSeqWithRetry(byte jointIndex, byte[] payload, int timeoutMs, CancellationToken ct)
+        private static Sc4iStatusReply SendAcquireSessionWithRetry(
+            UdpFrameChannel candidate, uint startSeq, ulong cardBootId, ulong sid,
+            int timeoutMs, CancellationToken ct, out uint finalSeq)
         {
-            // Retransmit the exact same seq on UDP loss so the firmware's replay guard (0x35)
-            // prevents duplicate execution while recovering promptly within the <1000 ms watchdog.
-            uint seq = nextSeq++;
-            if (seq == 0) seq = nextSeq++;
-            if (seq > maxUsedSeq) maxUsedSeq = seq;
-
-            const int maxAttempts = 4;
-            const int perAttemptTimeoutMs = 180;
+            finalSeq = startSeq;
+            const int maxAttempts = 6;
+            const int perAttemptTimeoutMs = 100;
             Stopwatch overall = Stopwatch.StartNew();
             TimeoutException lastTimeout = null;
 
@@ -503,7 +509,57 @@ namespace ScaraArm.Core.Transport
                 try
                 {
                     Sc4iStatusReply reply = SendF2OnChannel(
-                        channel, Sc4iSubcmd.MoveAxisPtp, jointIndex, seq, bootId, sessionId, payload, attemptTimeout, ct);
+                        candidate, Sc4iSubcmd.AcquireSession, 0, startSeq, cardBootId, sid, null, attemptTimeout, ct);
+                    if (attempt > 0 && reply.ErrorCode == 0x35u && reply.SessionId == sid)
+                    {
+                        uint confirmSeq = startSeq + 1u;
+                        if (confirmSeq == 0) confirmSeq = 1u;
+                        Sc4iStatusReply hb = SendF2OnChannelWithRetry(
+                            candidate, Sc4iSubcmd.Heartbeat, 0, confirmSeq, cardBootId, sid, null,
+                            timeoutMs, 60, 6, ct);
+                        if (hb.ErrorCode == 0u)
+                        {
+                            finalSeq = confirmSeq;
+                            return hb;
+                        }
+                        return reply;
+                    }
+                    return reply;
+                }
+                catch (TimeoutException ex)
+                {
+                    lastTimeout = ex;
+                    if (attempt + 1 >= maxAttempts || ct.IsCancellationRequested)
+                        throw;
+                }
+            }
+
+            throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。");
+        }
+
+        private Sc4iStatusReply SendCommandSameSeqWithRetry(
+            Sc4iSubcmd subcmd, byte arg, byte[] payload, int timeoutMs, int perAttemptTimeoutMs, int maxAttempts, CancellationToken ct)
+        {
+            // Retransmit the exact same seq on UDP loss so the firmware's replay guard (0x35)
+            // prevents duplicate execution while recovering promptly within the <1000 ms watchdog.
+            uint seq = nextSeq++;
+            if (seq == 0) seq = nextSeq++;
+            if (seq > maxUsedSeq) maxUsedSeq = seq;
+
+            Stopwatch overall = Stopwatch.StartNew();
+            TimeoutException lastTimeout = null;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                int remaining = timeoutMs - (int)overall.ElapsedMilliseconds;
+                if (remaining <= 0) break;
+                int attemptTimeout = Math.Min(perAttemptTimeoutMs, remaining);
+                if (attemptTimeout < 30 && attempt > 0) break;
+
+                try
+                {
+                    Sc4iStatusReply reply = SendF2OnChannel(
+                        channel, subcmd, arg, seq, bootId, sessionId, payload, attemptTimeout, ct);
                     if (attempt > 0 && reply.ErrorCode == 0x35u)
                     {
                         // The first packet was accepted by the card and only its reply was lost.
@@ -531,28 +587,30 @@ namespace ScaraArm.Core.Transport
         {
             // Idempotent keepalive/read/stop/enable/reset subcommands fast-retry on transient UDP EMI packet loss;
             // non-idempotent config/bus-init commands remain single-shot.
+            // Based on measured 2-5 ms card RTT and up to ~30% burst EMI loss, keep per-attempt windows tight
+            // so up to 14 retries still finish well below the card's 1000 ms watchdog.
             switch (subcmd)
             {
                 case Sc4iSubcmd.Heartbeat:
-                    perAttemptTimeoutMs = Math.Min(120, overallTimeoutMs);
-                    maxAttempts = 6;
+                    perAttemptTimeoutMs = Math.Min(45, overallTimeoutMs);
+                    maxAttempts = 14;
                     return;
                 case Sc4iSubcmd.JogKeepalive:
-                    perAttemptTimeoutMs = Math.Min(70, overallTimeoutMs);
-                    maxAttempts = 3;
+                    perAttemptTimeoutMs = Math.Min(40, overallTimeoutMs);
+                    maxAttempts = 6;
                     return;
                 case Sc4iSubcmd.StopHold:
-                    perAttemptTimeoutMs = Math.Min(150, overallTimeoutMs);
-                    maxAttempts = 5;
+                    perAttemptTimeoutMs = Math.Min(60, overallTimeoutMs);
+                    maxAttempts = 12;
                     return;
                 case Sc4iSubcmd.Snapshot:
-                    perAttemptTimeoutMs = Math.Min(150, overallTimeoutMs);
-                    maxAttempts = 3;
+                    perAttemptTimeoutMs = Math.Min(60, overallTimeoutMs);
+                    maxAttempts = 8;
                     return;
                 case Sc4iSubcmd.EnableAxes:
                 case Sc4iSubcmd.FaultReset:
-                    perAttemptTimeoutMs = Math.Min(250, overallTimeoutMs);
-                    maxAttempts = 4;
+                    perAttemptTimeoutMs = Math.Min(80, overallTimeoutMs);
+                    maxAttempts = 8;
                     return;
                 default:
                     perAttemptTimeoutMs = overallTimeoutMs;
