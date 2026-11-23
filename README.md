@@ -1,4 +1,4 @@
-# 四轴 SCARA 机械臂控制台（v0.1.0）
+# 四轴 SCARA 机械臂控制台（v0.2.0）
 
 面向四轴立柱升降式 SCARA 机械臂的独立 Windows 控制台与核心控制库（`.NET Framework 4.8` / `.NET 8`），基于 **吴大拿团队（胡强视觉运动开发 / 源小群）** 的全开源 EtherCAT 运动卡硬件平台与 4× **汇川 SV630N** 伺服驱动器适配开发，支持**关节单轴低速调试**与**四轴 SCARA 笛卡尔坐标系 `(X, Y, Z, R)` 安全联动控制**。
 
@@ -40,12 +40,13 @@
 
 ---
 
-## 核心特性（v0.1.0）
+## 核心特性（v0.2.0）
 
 - **默认安全离线**：启动时不自动连接控制卡、不初始化总线、不上电机使能；用户显式点击“连接”后完成握手与只读进 OP（电机保持未使能），急停与停止均保持伺服持力（`0x605A=6` 仅写 RAM）。
 - **关节单轴调试**：选轴、单轴使能/重新授权、低速小步长相对定位、按住点动与保活监督、两步清故障/解锁。
 - **四轴 SCARA 笛卡尔控制**：实时正运动学 `(X, Y, Z, R)` 与手系显示、逆运动学求解、工作空间与四轴软限位预检、安全运动顺序（**上升先提 Z、下降后降 Z**）、一键设零点与 `scara-calibration.ini` 持久化。
-- **分层解耦架构**：核心协议、UDP 会话通信、运动学与标定、笛卡尔运动编排全部沉淀在零 UI 依赖的 `ScaraArm.Core` 类库中，可跨平台离线单测。
+- **示教与任务编排（v0.2.0 新增）**：一键示教当前姿态与离线点位编辑（支持通用/取料/放料/安全类型、保 R、手系、到位停留时间与单点启用开关），支持 `scara-program.ini` 自动持久化及任意任务文件导入导出；完整复用 Motion 层执行**门型安全提 Z 通行**、全路径启动前预检（逆解、软限位、单步圈数上限、循环首尾衔接与完后回零）、固定/无限循环取放、停留期心跳保活与随时安全急停。
+- **分层解耦架构**：核心协议、UDP 会话通信、运动学与标定、笛卡尔运动编排、示教任务编排全部沉淀在零 UI 依赖的 `ScaraArm.Core` 类库中，可跨平台离线单测。
 
 ---
 
@@ -55,6 +56,9 @@
 
 ```text
 ScaraArm.Console (WinForms UI, net48)
+        │
+        ▼
+ScaraArm.Core.Tasks       ── 示教点位表、INI 持久化与多点循环取放编排（复用 Motion 层）
         │
         ▼
 ScaraArm.Core.Motion      ── 笛卡尔安全规划与逐步到位编排（依赖接口，可离线单测）
@@ -69,7 +73,7 @@ ScaraArm.Core.Motion      ── 笛卡尔安全规划与逐步到位编排（�
 
 ```text
 ScaraArm.sln                        解决方案入口
-Directory.Build.props               统一版本号 (0.1.0) 与编译选项
+Directory.Build.props               统一版本号 (0.2.0) 与编译选项
 启动控制台.cmd                       Windows 一键构建 / 启动入口
 src/
   ScaraArm.Core/                    核心控制库（net48;net8.0，零 UI 依赖）
@@ -77,14 +81,15 @@ src/
     Transport/                      UDP 通道、SC4I 会话客户端与运动前安全联锁
     Kinematics/                     SCARA 标定、INI 读写与正/逆运动学
     Motion/                         笛卡尔安全序列规划与执行器
+    Tasks/                          示教点位模型、INI 持久化与循环取放编排器
   ScaraArm.Console/                 Windows 控制台界面（net48 WinForms）
     Assets/                         多分辨率工业风应用图标 (app.ico)
     Theme/                          配色、字体与布局样式工具
-    Controls/                       AxisCard、关节面板、笛卡尔面板
-    Dialogs/                        网络设置、设零点、标定参数弹窗
+    Controls/                       AxisCard、关节面板、笛卡尔面板、示教与任务面板
+    Dialogs/                        网络设置、设零点、标定参数、点位编辑弹窗
     Diagnostics/                    离线 UI 冒烟检查 (--ui-smoke-test)
     MainForm.cs                     主窗体布局、弹窗入口与状态绑定
-    MainForm.Operations.cs          会话生命周期、心跳轮询、点动与急停操作
+    MainForm.Operations.cs          会话生命周期、心跳轮询、点动、任务与急停操作
 tests/                              离线单元测试与 Windows 启动器校验（net8.0）
 scripts/                            Windows 构建、一键启动与资料索引脚本
 docs/                               使用说明、协议核对、验证记录与硬件资料索引

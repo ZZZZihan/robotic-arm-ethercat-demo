@@ -75,3 +75,19 @@
   - `dotnet build ScaraArm.sln -c Release` 全量构建通过（`ScaraArm.Core` net48 + net8.0、`ScaraArm.Console` net48、`ScaraArm.Tests` net8.0），0 警告、0 错误。
   - `dotnet run --project tests/ScaraArm.Tests.csproj -c Release` 共 **134 项离线断言全部通过**（`protocol=35, client=28, scara=49, planner=22`），新增覆盖笛卡尔“上升先提 Z / 下降后降 Z”顺序、未使能拦截及急停中途终止。
   - Windows 实机 `--ui-smoke-test` 与 `tests/LauncherChecks.ps1` 需在 Windows 环境或 GitHub Actions `windows` 任务中执行验证。
+
+## v0.2.0 示教与任务编排：Windows 冒烟与 ThinkBook 实机验收（2026-11-23）
+
+- **新增分层与持久化**：
+  - 在 `ScaraArm.Core.Tasks` 层新增 `TeachWaypoint` / `TeachProgram`、`TeachProgramStore`（UTF-8 INI 往返持久化）与 `TaskProgramRunner`（全路径启动前预检、门型安全提 Z 分段、固定/无限循环与停留期心跳保活），完全复用 `CartesianMotionPlanner`。
+  - 在 `ScaraArm.Console` 新增 `示教与任务` 面板（`TeachTaskPanel`）与点位编辑弹窗（`WaypointEditDialog`），支持自动保存 `scara-program.ini`、任意任务文件导入导出、单步到位、预检、循环运行与随时安全停机。
+- **实机暴露并修复的现场抗干扰问题**：
+  - ThinkBook 实机在四轴伺服持力/运动 PWM 干扰下实测 `ping 192.168.8.20` 存在约 6% 单包丢包（15 发 14 收，RTT 1 ms），导致原单次发包的 `MoveAxisPtp` / `FaultReset` 在连续多点任务中偶发 3000 ms 超时。
+  - 在 `Sc4iClient` 为 `MoveAxisPtp` 补充**同序列号（`seq`）防重放快速重传**（180 ms × 4 次，重传遇 `0x35` 说明首包已生效并用 `Heartbeat` 确认状态，杜绝重复运动）并为幂等的 `EnableAxes`/`FaultReset`/`Heartbeat` 优化重传策略，同时补充 2 项 UDP 丢包回环单测。
+- **离线单测与 Windows UI 冒烟（ThinkBook + macOS）**：
+  - `dotnet build ScaraArm.sln -c Release` 0 警告、0 错误；`ScaraArm.Tests` 共 **176 项断言全通过**（`protocol=35, client=30, scara=49, planner=22, tasks=40`）。
+  - ThinkBook 执行 `scripts/build-windows.ps1` 产出 `ScaraArm.Console.exe`（`net48`）并实跑 `--ui-smoke-test`：**24 项 Windows 离线界面检查全通过**（含关节/笛卡尔/示教与任务三模式切换、离线安全锁定与视口边界检查），并对三模式截图完成人工/自动视觉复核，修正了 `门型安全提 Z` 输入框 3 px 垂直对齐细节。
+  - 通过非交互 SSH 执行 `tests/LauncherChecks.ps1` 时，成品 `BuildOnly` 与 `VerifyOnly` 离线检查均通过，无参数实开桌面窗体检测受限于 SSH 非交互会话（需在 Windows 本地桌面或 GitHub Actions `windows-latest` runner 中执行）。
+- **ThinkBook 四轴 SCARA 实机闭环验收**：
+  - 使用现场 `scara-calibration.ini` 与 `scara-program.ini`（3 点位：启用 `P1 取料点 (360, 30, 105, R=0°)` 与 `P2 放料点 (360, -20, 105, R=0°)`，各停留 `400 ms`；禁用跳过点 `P_SKIP`；门型安全提 Z `120.0 mm`；速度 `0.35 圈/秒`；完后回零）。
+  - 完整验证四轴使能（`EnMask=0xF, AuthMask=0xF`）→ 启动前预检 → 连续 2 轮门型循环取放（`P1 → P2 → P1 → P2`，重复定位 `360.00, ±20/30, 105.00–105.01 mm, R=0.00°`）与收尾 1 轮取放 + 完整回安全零点：`LIVE_TASK_PASS`（`Elapsed=84.13s, ProgressEvents=594, DwellHeartbeats=6, MaxPdoAge=0ms, LatchedFault=0x0, Estop=0, DrvErr=[0x0000×4]`），最终精准归位至 `X=395.00 mm, Y=0.00 mm, Z=108.01 mm, R=0.00°`。

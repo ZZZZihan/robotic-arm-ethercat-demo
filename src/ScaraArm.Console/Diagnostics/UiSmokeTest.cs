@@ -47,7 +47,7 @@ namespace ScaraArm.Console.Diagnostics
             form.SelectAxis(0);
 
             form.SetControlMode(true);
-            check(form.IsCartesianMode && form.CartesianPanel.Visible && !form.JointPanel.Visible,
+            check(form.IsCartesianMode && form.CartesianPanel.Visible && !form.JointPanel.Visible && !form.TeachPanel.Visible,
                 "可切换到笛卡尔坐标模式");
             check(!form.CartesianPanel.EnableAllButtonEnabled
                 && !form.CartesianPanel.MoveTargetButtonEnabled
@@ -56,7 +56,22 @@ namespace ScaraArm.Console.Diagnostics
                 "离线时锁定所有笛卡尔运动与设零按钮");
             for (int i = 0; i < form.CartesianPanel.JogButtonCount; i++)
                 check(!form.CartesianPanel.IsJogButtonEnabled(i), "离线时锁定笛卡尔点动按钮 " + i);
-            form.SetControlMode(false);
+
+            form.SetControlMode(ConsoleControlMode.TeachTask);
+            check(form.IsTeachMode && form.TeachPanel.Visible && !form.JointPanel.Visible && !form.CartesianPanel.Visible,
+                "可切换到示教与任务编排模式");
+            check(!form.TeachPanel.TeachCurrentButtonEnabled
+                && !form.TeachPanel.EnableAllButtonEnabled
+                && !form.TeachPanel.MoveSelectedButtonEnabled
+                && !form.TeachPanel.ValidateButtonEnabled
+                && !form.TeachPanel.RunTaskButtonEnabled
+                && !form.TeachPanel.StopTaskButtonEnabled,
+                "离线时锁定示教采样与任务执行按钮");
+            check(form.TeachPanel.AddWaypointButtonEnabled
+                && form.TeachPanel.LoadButtonEnabled
+                && form.TeachPanel.SaveButtonEnabled,
+                "离线时允许预编辑与加载保存示教点位文件");
+            form.SetControlMode(ConsoleControlMode.Joint);
 
             form.PerformLayout();
             form.Update();
@@ -84,7 +99,15 @@ namespace ScaraArm.Console.Diagnostics
                     form.DrawToBitmap(cartBmp, new Rectangle(0, 0, form.Width, form.Height));
                     cartBmp.Save(Path.Combine(directory ?? "", "smoke-cart-ui.png"), ImageFormat.Png);
                 }
-                form.SetControlMode(false);
+                form.SetControlMode(ConsoleControlMode.TeachTask);
+                form.PerformLayout();
+                form.Update();
+                using (Bitmap teachBmp = new Bitmap(form.Width, form.Height))
+                {
+                    form.DrawToBitmap(teachBmp, new Rectangle(0, 0, form.Width, form.Height));
+                    teachBmp.Save(Path.Combine(directory ?? "", "smoke-teach-ui.png"), ImageFormat.Png);
+                }
+                form.SetControlMode(ConsoleControlMode.Joint);
             }
 
             report = "PASS: " + checks + " offline UI checks; no hardware operations.";

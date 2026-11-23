@@ -7,6 +7,7 @@ using ScaraArm.Console.Theme;
 using ScaraArm.Core.Kinematics;
 using ScaraArm.Core.Motion;
 using ScaraArm.Core.Protocol;
+using ScaraArm.Core.Tasks;
 using ScaraArm.Core.Transport;
 
 namespace ScaraArm.Console
@@ -21,8 +22,9 @@ namespace ScaraArm.Console
             formClosing = true;
             pollTimer.Stop();
             jogTimer.Stop();
-            bool shouldStop = jogActive || (liveStatus != null && liveStatus.MotionState != 0);
+            bool shouldStop = jogActive || taskRunning || (liveStatus != null && liveStatus.MotionState != 0);
             jogActive = false;
+            taskRunning = false;
             jogGeneration++;
             CancelAllInFlightOps();
             if (sc4iClient.IsConnected && shouldStop)
@@ -97,8 +99,9 @@ namespace ScaraArm.Console
             busy = true;
             pollTimer.Stop();
             jogTimer.Stop();
-            bool shouldStop = jogActive || (liveStatus != null && liveStatus.MotionState != 0);
+            bool shouldStop = jogActive || taskRunning || (liveStatus != null && liveStatus.MotionState != 0);
             jogActive = false;
+            taskRunning = false;
             jogGeneration++;
             CancelAllInFlightOps();
             RefreshUi();
@@ -311,6 +314,146 @@ namespace ScaraArm.Console
                 if (IsDisposed || Disposing || !sc4iClient.IsConnected) return;
                 if (progress.LatestStatus != null) liveStatus = progress.LatestStatus;
                 if (!String.IsNullOrEmpty(progress.Message)) SetStatus(progress.Message, UiTheme.Accent);
+                RefreshUi();
+            };
+
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(apply); } catch { }
+            }
+            else
+            {
+                apply();
+            }
+        }
+
+        private Task RunTeachProgramAsync()
+        {
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            AutoSaveTeachProgram();
+            return ExecuteTaskProgramAsync(teachProgram.Clone(), false, "正在启动循环取放任务…");
+        }
+
+        private Task MoveToSelectedWaypointAsync(int index)
+        {
+            if (index < 0 || index >= teachProgram.Waypoints.Count)
+                return Task.FromResult(0);
+
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            TeachWaypoint targetWp = teachProgram.Waypoints[index].Clone();
+            targetWp.Enabled = true;
+            targetWp.DwellMs = 0;
+
+            TeachProgram singleProgram = new TeachProgram
+            {
+                Name = "单步到位：" + targetWp.DisplayName,
+                VelocityRevPerSec = teachProgram.VelocityRevPerSec,
+                AccelerationRevPerSec2 = teachProgram.AccelerationRevPerSec2,
+                UseSafeTransitZ = teachProgram.UseSafeTransitZ,
+                SafeTransitZMm = teachProgram.SafeTransitZMm,
+                RepeatCycles = 1,
+                ReturnHomeOnComplete = false
+            };
+            singleProgram.Waypoints.Add(targetWp);
+            return ExecuteTaskProgramAsync(singleProgram, true, "正在单步定位至 " + targetWp.DisplayName + "…");
+        }
+
+        private async Task ExecuteTaskProgramAsync(TeachProgram programToRun, bool singleWaypointMode, string startMessage)
+        {
+            if (busy || jogActive || taskRunning || sessionLost || !sc4iClient.IsConnected || programToRun == null)
+                return;
+
+            TaskValidationResult validation = TaskProgramRunner.ValidateProgram(calibration, liveStatus, programToRun);
+            if (!validation.Success)
+            {
+                if (!singleWaypointMode && validation.FailedWaypointIndex >= 0)
+                    teachPanel.SelectWaypoint(validation.FailedWaypointIndex);
+                SetStatus(validation.Error, UiTheme.Danger);
+                return;
+            }
+
+            busy = true;
+            taskRunning = true;
+            activeTaskWaypointIndex = -1;
+            activeTaskProgressText = startMessage;
+            SetStatus(startMessage, UiTheme.Accent);
+            RefreshUi();
+
+            CancellationTokenSource cts = new CancellationTokenSource();
+            CancelAndDisposeCts(ref activeOpCts);
+            activeOpCts = cts;
+            try
+            {
+                TaskRunResult result = await TaskProgramRunner.RunAsync(
+                    sc4iClient,
+                    calibration,
+                    liveStatus,
+                    programToRun,
+                    p => OnTaskProgress(p, singleWaypointMode),
+                    cts.Token);
+
+                if (result != null && result.FinalStatus != null)
+                    liveStatus = result.FinalStatus;
+
+                if (!IsDisposed && !Disposing)
+                {
+                    FillTargetFromCurrentIfConnected();
+                    string doneMsg = singleWaypointMode
+                        ? (programToRun.Waypoints[0].DisplayName + " 已单步到位。")
+                        : String.Format(
+                            CultureInfo.InvariantCulture,
+                            "循环任务已完成：共执行 {0} 轮（{1} 个点位）。",
+                            result != null ? result.CompletedCycles : 0,
+                            result != null ? result.ExecutedWaypoints : 0);
+                    SetStatus(doneMsg, UiTheme.Success);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                if (!formClosing && !IsDisposed && !Disposing && sc4iClient.IsConnected && ReferenceEquals(activeOpCts, cts))
+                    SetStatus("任务已停止。", UiTheme.Accent);
+            }
+            catch (Sc4iCommandException error)
+            {
+                liveStatus = error.Status;
+                HandleSessionErrorIfNeeded(error);
+                if (!IsDisposed && !Disposing && !sessionLost) SetStatus(error.Message, UiTheme.Danger);
+            }
+            catch (Exception error)
+            {
+                if (!IsDisposed && !Disposing) SetStatus("任务执行失败：" + error.Message, UiTheme.Danger);
+            }
+            finally
+            {
+                if (ReferenceEquals(activeOpCts, cts)) activeOpCts = null;
+                cts.Dispose();
+                taskRunning = false;
+                activeTaskWaypointIndex = -1;
+                activeTaskProgressText = null;
+                busy = false;
+                if (!IsDisposed && !Disposing) RefreshUi();
+            }
+        }
+
+        private async Task StopTaskAsync()
+        {
+            if (!taskRunning) return;
+            await TriggerStopHoldAsync("已停止任务并保持伺服持力");
+        }
+
+        private void OnTaskProgress(TaskRunProgress progress, bool singleWaypointMode)
+        {
+            if (progress == null || IsDisposed || Disposing) return;
+            Action apply = delegate
+            {
+                if (IsDisposed || Disposing || !sc4iClient.IsConnected) return;
+                if (progress.LatestStatus != null) liveStatus = progress.LatestStatus;
+                if (!singleWaypointMode) activeTaskWaypointIndex = progress.WaypointIndex;
+                if (!String.IsNullOrEmpty(progress.Message))
+                {
+                    activeTaskProgressText = progress.Message;
+                    SetStatus(progress.Message, UiTheme.Accent);
+                }
                 RefreshUi();
             };
 

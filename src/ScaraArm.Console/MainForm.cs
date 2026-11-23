@@ -10,10 +10,18 @@ using ScaraArm.Console.Theme;
 using ScaraArm.Core.Kinematics;
 using ScaraArm.Core.Motion;
 using ScaraArm.Core.Protocol;
+using ScaraArm.Core.Tasks;
 using ScaraArm.Core.Transport;
 
 namespace ScaraArm.Console
 {
+    internal enum ConsoleControlMode
+    {
+        Joint = 0,
+        Cartesian = 1,
+        TeachTask = 2
+    }
+
     /// <summary>
     /// Top-level Windows console window: layout composition, dialogs, and telemetry view binding.
     /// Async hardware operations live in MainForm.Operations.cs.
@@ -31,7 +39,9 @@ namespace ScaraArm.Console
 
         private NetworkEndpointConfig endpoint = NetworkEndpointConfig.CreateDefault();
         private readonly string calibrationPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scara-calibration.ini");
+        private readonly string programPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scara-program.ini");
         private ScaraCalibration calibration = new ScaraCalibration();
+        private TeachProgram teachProgram = new TeachProgram();
 
         private readonly Label connectionBadge = new Label();
         private readonly Button connectButton = new Button();
@@ -45,17 +55,22 @@ namespace ScaraArm.Console
         private readonly Label cartesianBranchLabel = new Label();
         private readonly Button jointModeButton = new Button();
         private readonly Button cartModeButton = new Button();
+        private readonly Button teachModeButton = new Button();
         private readonly Button setZeroButton = new Button();
         private readonly Button calDialogButton = new Button();
 
         private readonly Panel controlPanel = new Panel();
         private readonly JointControlPanel jointPanel;
         private readonly CartesianControlPanel cartesianPanel;
+        private readonly TeachTaskPanel teachPanel;
         private readonly Label statusLabel = new Label();
 
-        private bool cartesianMode;
+        private ConsoleControlMode controlMode = ConsoleControlMode.Joint;
         private int selectedAxis;
         private bool busy;
+        private bool taskRunning;
+        private int activeTaskWaypointIndex = -1;
+        private string activeTaskProgressText;
         private bool pollInFlight;
         private bool jogActive;
         private bool jogKeepaliveInFlight;
@@ -77,10 +92,12 @@ namespace ScaraArm.Console
         internal bool SetZeroButtonEnabled { get { return setZeroButton.Enabled; } }
         internal int AxisCardCount { get { return axisCards.Length; } }
         internal int SelectedAxisIndex { get { return selectedAxis; } }
-        internal bool IsCartesianMode { get { return cartesianMode; } }
+        internal bool IsCartesianMode { get { return controlMode == ConsoleControlMode.Cartesian; } }
+        internal bool IsTeachMode { get { return controlMode == ConsoleControlMode.TeachTask; } }
         internal NetworkEndpointConfig Endpoint { get { return endpoint; } }
         internal JointControlPanel JointPanel { get { return jointPanel; } }
         internal CartesianControlPanel CartesianPanel { get { return cartesianPanel; } }
+        internal TeachTaskPanel TeachPanel { get { return teachPanel; } }
 
         internal MainForm()
         {
@@ -90,8 +107,8 @@ namespace ScaraArm.Console
             Font = theme.Regular;
             ForeColor = UiTheme.Ink;
             BackColor = UiTheme.Bg;
-            ClientSize = new Size(760, 620);
-            MinimumSize = new Size(720, 580);
+            ClientSize = new Size(820, 650);
+            MinimumSize = new Size(760, 600);
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.Dpi;
             DoubleBuffered = true;
@@ -99,8 +116,13 @@ namespace ScaraArm.Console
             try { calibration = ScaraCalibration.LoadOrDefault(calibrationPath); }
             catch { calibration = new ScaraCalibration(); }
 
+            try { teachProgram = TeachProgramStore.LoadOrDefault(programPath); }
+            catch { teachProgram = new TeachProgram(); }
+
             jointPanel = new JointControlPanel(theme);
             cartesianPanel = new CartesianControlPanel(theme);
+            teachPanel = new TeachTaskPanel(theme);
+            teachPanel.BindProgram(teachProgram, -1);
 
             BuildLayout();
             WireChildEvents();
@@ -147,11 +169,17 @@ namespace ScaraArm.Console
 
         internal void SetControlMode(bool useCartesian)
         {
-            if (jogActive) return;
-            cartesianMode = useCartesian;
-            jointPanel.Visible = !cartesianMode;
-            cartesianPanel.Visible = cartesianMode;
-            if (cartesianMode) FillTargetFromCurrentIfConnected();
+            SetControlMode(useCartesian ? ConsoleControlMode.Cartesian : ConsoleControlMode.Joint);
+        }
+
+        internal void SetControlMode(ConsoleControlMode mode)
+        {
+            if (jogActive || taskRunning) return;
+            controlMode = mode;
+            jointPanel.Visible = controlMode == ConsoleControlMode.Joint;
+            cartesianPanel.Visible = controlMode == ConsoleControlMode.Cartesian;
+            teachPanel.Visible = controlMode == ConsoleControlMode.TeachTask;
+            if (controlMode == ConsoleControlMode.Cartesian) FillTargetFromCurrentIfConnected();
             RefreshUi();
         }
 
@@ -291,35 +319,41 @@ namespace ScaraArm.Console
 
         private Control BuildModeBar()
         {
-            TableLayoutPanel bar = UiTheme.CreateGrid(5, 1);
+            TableLayoutPanel bar = UiTheme.CreateGrid(6, 1);
             bar.Padding = new Padding(0, 0, 0, 8);
             bar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 174));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 138));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 114));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
 
             UiTheme.StyleButton(jointModeButton, "关节单轴", UiTheme.Accent, Color.White, 0);
-            UiTheme.StyleButton(cartModeButton, "笛卡尔坐标 (SCARA)", UiTheme.CardBg, UiTheme.Ink, 1);
+            UiTheme.StyleButton(cartModeButton, "笛卡尔 (SCARA)", UiTheme.CardBg, UiTheme.Ink, 1);
+            UiTheme.StyleButton(teachModeButton, "示教与任务", UiTheme.CardBg, UiTheme.Ink, 1);
             UiTheme.StyleButton(setZeroButton, "设为零点", UiTheme.CardBg, UiTheme.Ink, 1);
             UiTheme.StyleButton(calDialogButton, "标定参数", UiTheme.CardBg, UiTheme.Muted, 1);
             jointModeButton.Font = theme.Bold;
             cartModeButton.Font = theme.Bold;
+            teachModeButton.Font = theme.Bold;
             jointModeButton.Margin = new Padding(0, 0, 8, 0);
             cartModeButton.Margin = new Padding(0, 0, 8, 0);
+            teachModeButton.Margin = new Padding(0, 0, 8, 0);
             setZeroButton.Margin = new Padding(0, 0, 8, 0);
             calDialogButton.Margin = new Padding(0);
 
-            jointModeButton.Click += delegate { SetControlMode(false); };
-            cartModeButton.Click += delegate { SetControlMode(true); };
+            jointModeButton.Click += delegate { SetControlMode(ConsoleControlMode.Joint); };
+            cartModeButton.Click += delegate { SetControlMode(ConsoleControlMode.Cartesian); };
+            teachModeButton.Click += delegate { SetControlMode(ConsoleControlMode.TeachTask); };
             setZeroButton.Click += delegate { CaptureCurrentAsZero(); };
             calDialogButton.Click += delegate { ShowCalibrationDialog(); };
 
             bar.Controls.Add(jointModeButton, 0, 0);
             bar.Controls.Add(cartModeButton, 1, 0);
-            bar.Controls.Add(setZeroButton, 3, 0);
-            bar.Controls.Add(calDialogButton, 4, 0);
+            bar.Controls.Add(teachModeButton, 2, 0);
+            bar.Controls.Add(setZeroButton, 4, 0);
+            bar.Controls.Add(calDialogButton, 5, 0);
             return bar;
         }
 
@@ -336,8 +370,10 @@ namespace ScaraArm.Console
             };
 
             cartesianPanel.Visible = false;
+            teachPanel.Visible = false;
             controlPanel.Controls.Add(jointPanel);
             controlPanel.Controls.Add(cartesianPanel);
+            controlPanel.Controls.Add(teachPanel);
             return controlPanel;
         }
 
@@ -353,6 +389,22 @@ namespace ScaraArm.Console
             cartesianPanel.FillCurrentRequested += delegate { FillTargetFromCurrentIfConnected(); };
             cartesianPanel.RelativeStepRequested += async axis => await MoveCartesianStepAsync(axis);
             cartesianPanel.AbsoluteMoveRequested += async target => await ExecuteCartesianMoveAsync(target);
+
+            teachPanel.EnableAllRequested += async delegate { await EnableAllAxesAsync(); };
+            teachPanel.TeachCurrentRequested += delegate { TeachCurrentPoseAsWaypoint(); };
+            teachPanel.AddWaypointRequested += delegate { AddWaypointViaDialog(); };
+            teachPanel.EditWaypointRequested += idx => EditWaypointViaDialog(idx);
+            teachPanel.MoveUpRequested += idx => MoveWaypoint(idx, -1);
+            teachPanel.MoveDownRequested += idx => MoveWaypoint(idx, 1);
+            teachPanel.DeleteWaypointRequested += idx => DeleteWaypoint(idx);
+            teachPanel.WaypointEnabledToggled += (idx, en) => ToggleWaypointEnabled(idx, en);
+            teachPanel.LoadProgramRequested += delegate { LoadTeachProgramFromDialog(); };
+            teachPanel.SaveProgramRequested += delegate { SaveTeachProgramViaDialog(); };
+            teachPanel.ProgramSettingsChanged += delegate { OnTeachProgramSettingsChanged(); };
+            teachPanel.ValidateProgramRequested += delegate { ValidateTeachProgramNow(); };
+            teachPanel.MoveSelectedWaypointRequested += async idx => await MoveToSelectedWaypointAsync(idx);
+            teachPanel.RunTaskRequested += async delegate { await RunTeachProgramAsync(); };
+            teachPanel.StopTaskRequested += async delegate { await StopTaskAsync(); };
         }
 
         private void ShowSettingsDialog()
@@ -422,11 +474,223 @@ namespace ScaraArm.Console
 
         private void FillTargetFromCurrentIfConnected()
         {
+            ScaraCartesianPose cart = TryGetLiveCartesianPose();
+            if (cart != null) cartesianPanel.FillTarget(cart);
+        }
+
+        private ScaraCartesianPose TryGetLiveCartesianPose()
+        {
             int[] counts;
-            if (liveStatus == null || !liveStatus.TryExtractLiveCounts(out counts)) return;
+            if (liveStatus == null || !liveStatus.TryExtractLiveCounts(out counts)) return null;
             ScaraJointPose joints;
-            ScaraCartesianPose cart = ScaraKinematics.ForwardFromCounts(calibration, counts, out joints);
-            cartesianPanel.FillTarget(cart);
+            return ScaraKinematics.ForwardFromCounts(calibration, counts, out joints);
+        }
+
+        private void TeachCurrentPoseAsWaypoint()
+        {
+            if (busy || jogActive || taskRunning) return;
+            ScaraCartesianPose livePose = TryGetLiveCartesianPose();
+            if (livePose == null)
+            {
+                SetStatus("请先连接控制卡并进 OP 后再示教当前位置。", UiTheme.Danger);
+                return;
+            }
+
+            int nextNum = teachProgram.Waypoints.Count + 1;
+            WaypointRole suggestedRole = (nextNum % 2 == 1) ? WaypointRole.Pick : WaypointRole.Place;
+            int suggestedDwell = (suggestedRole == WaypointRole.Pick || suggestedRole == WaypointRole.Place) ? 300 : 0;
+            string name = "P" + nextNum.ToString(CultureInfo.InvariantCulture) + " " + TeachWaypoint.FormatRole(suggestedRole) + "点";
+            TeachWaypoint wp = TeachWaypoint.FromCartesianPose(
+                name,
+                livePose,
+                suggestedRole,
+                cartesianPanel.KeepWorldR,
+                cartesianPanel.ElbowPreference,
+                suggestedDwell);
+
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            teachProgram.Waypoints.Add(wp);
+            int idx = teachProgram.Waypoints.Count - 1;
+            teachPanel.BindProgram(teachProgram, idx);
+            AutoSaveTeachProgram();
+            SetStatus(String.Format(
+                CultureInfo.InvariantCulture,
+                "已示教点位 #{0}（{1}）：({2:0.1}, {3:0.1}, {4:0.1} mm, R={5:0.1}°)。",
+                idx + 1, wp.DisplayName, wp.XMm, wp.YMm, wp.ZMm, wp.RDeg), UiTheme.Success);
+            RefreshUi();
+        }
+
+        private void AddWaypointViaDialog()
+        {
+            if (busy || jogActive || taskRunning) return;
+            ScaraCartesianPose livePose = TryGetLiveCartesianPose();
+            int nextNum = teachProgram.Waypoints.Count + 1;
+            TeachWaypoint draft = livePose != null
+                ? TeachWaypoint.FromCartesianPose("P" + nextNum.ToString(CultureInfo.InvariantCulture), livePose)
+                : new TeachWaypoint
+                {
+                    Name = "P" + nextNum.ToString(CultureInfo.InvariantCulture),
+                    XMm = calibration.MaxReachMm,
+                    YMm = 0.0,
+                    ZMm = calibration.ZeroHeightMm,
+                    RDeg = 0.0
+                };
+
+            TeachWaypoint created;
+            if (!WaypointEditDialog.TryEdit(this, theme, "添加示教点位", draft, livePose, out created))
+                return;
+
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            teachProgram.Waypoints.Add(created);
+            int idx = teachProgram.Waypoints.Count - 1;
+            teachPanel.BindProgram(teachProgram, idx);
+            AutoSaveTeachProgram();
+            SetStatus("已添加点位：" + created.DisplayName + "。", UiTheme.Success);
+            RefreshUi();
+        }
+
+        private void EditWaypointViaDialog(int index)
+        {
+            if (busy || jogActive || taskRunning) return;
+            if (index < 0 || index >= teachProgram.Waypoints.Count) return;
+
+            TeachWaypoint edited;
+            if (!WaypointEditDialog.TryEdit(this, theme, "编辑示教点位 #" + (index + 1), teachProgram.Waypoints[index], TryGetLiveCartesianPose(), out edited))
+                return;
+
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            teachProgram.Waypoints[index] = edited;
+            teachPanel.BindProgram(teachProgram, index);
+            AutoSaveTeachProgram();
+            SetStatus("已更新点位 #" + (index + 1) + "：" + edited.DisplayName + "。", UiTheme.Success);
+            RefreshUi();
+        }
+
+        private void MoveWaypoint(int index, int delta)
+        {
+            if (busy || jogActive || taskRunning) return;
+            int targetIdx = index + delta;
+            if (index < 0 || index >= teachProgram.Waypoints.Count) return;
+            if (targetIdx < 0 || targetIdx >= teachProgram.Waypoints.Count) return;
+
+            TeachWaypoint item = teachProgram.Waypoints[index];
+            teachProgram.Waypoints.RemoveAt(index);
+            teachProgram.Waypoints.Insert(targetIdx, item);
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            teachPanel.BindProgram(teachProgram, targetIdx);
+            AutoSaveTeachProgram();
+            RefreshUi();
+        }
+
+        private void DeleteWaypoint(int index)
+        {
+            if (busy || jogActive || taskRunning) return;
+            if (index < 0 || index >= teachProgram.Waypoints.Count) return;
+
+            string removed = teachProgram.Waypoints[index].DisplayName;
+            teachProgram.Waypoints.RemoveAt(index);
+            int nextSel = Math.Min(index, teachProgram.Waypoints.Count - 1);
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            teachPanel.BindProgram(teachProgram, nextSel);
+            AutoSaveTeachProgram();
+            SetStatus("已删除点位：" + removed + "。", UiTheme.Muted);
+            RefreshUi();
+        }
+
+        private void ToggleWaypointEnabled(int index, bool enabled)
+        {
+            if (busy || jogActive || taskRunning) return;
+            if (index < 0 || index >= teachProgram.Waypoints.Count) return;
+
+            teachProgram.Waypoints[index].Enabled = enabled;
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            teachPanel.BindProgram(teachProgram, index);
+            AutoSaveTeachProgram();
+            RefreshUi();
+        }
+
+        private void OnTeachProgramSettingsChanged()
+        {
+            if (busy || jogActive || taskRunning) return;
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            AutoSaveTeachProgram();
+            RefreshUi();
+        }
+
+        private void LoadTeachProgramFromDialog()
+        {
+            if (busy || jogActive || taskRunning) return;
+            using (OpenFileDialog dlg = new OpenFileDialog())
+            {
+                dlg.Title = "加载示教点位任务文件";
+                dlg.Filter = "SCARA 示教任务 (*.ini)|*.ini|所有文件 (*.*)|*.*";
+                dlg.InitialDirectory = Path.GetDirectoryName(programPath);
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                try
+                {
+                    teachProgram = TeachProgramStore.LoadFromFile(dlg.FileName);
+                    teachPanel.BindProgram(teachProgram, teachProgram.Waypoints.Count > 0 ? 0 : -1);
+                    AutoSaveTeachProgram();
+                    SetStatus("已加载任务文件（" + teachProgram.Waypoints.Count + " 个点位）：" + Path.GetFileName(dlg.FileName), UiTheme.Success);
+                    RefreshUi();
+                }
+                catch (Exception ex)
+                {
+                    SetStatus("加载示教任务失败：" + ex.Message, UiTheme.Danger);
+                }
+            }
+        }
+
+        private void SaveTeachProgramViaDialog()
+        {
+            if (busy || jogActive || taskRunning) return;
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            using (SaveFileDialog dlg = new SaveFileDialog())
+            {
+                dlg.Title = "保存示教点位任务文件";
+                dlg.Filter = "SCARA 示教任务 (*.ini)|*.ini|所有文件 (*.*)|*.*";
+                dlg.InitialDirectory = Path.GetDirectoryName(programPath);
+                dlg.FileName = Path.GetFileName(programPath);
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                try
+                {
+                    TeachProgramStore.SaveToFile(teachProgram, dlg.FileName);
+                    AutoSaveTeachProgram();
+                    SetStatus("已保存示教任务（" + teachProgram.Waypoints.Count + " 个点位）：" + Path.GetFileName(dlg.FileName), UiTheme.Success);
+                }
+                catch (Exception ex)
+                {
+                    SetStatus("保存示教任务失败：" + ex.Message, UiTheme.Danger);
+                }
+            }
+        }
+
+        private void AutoSaveTeachProgram()
+        {
+            try
+            {
+                TeachProgramStore.SaveToFile(teachProgram, programPath);
+            }
+            catch { }
+        }
+
+        private void ValidateTeachProgramNow()
+        {
+            if (busy || jogActive || taskRunning) return;
+            teachPanel.ApplySettingsToProgram(teachProgram);
+            TaskValidationResult res = TaskProgramRunner.ValidateProgram(calibration, liveStatus, teachProgram);
+            if (!res.Success)
+            {
+                if (res.FailedWaypointIndex >= 0) teachPanel.SelectWaypoint(res.FailedWaypointIndex);
+                SetStatus("任务预检未通过：" + res.Error, UiTheme.Danger);
+                return;
+            }
+            SetStatus(String.Format(
+                CultureInfo.InvariantCulture,
+                "任务预检通过：{0} 个启用点位，每轮 {1} 段路径（逆解、软限位与单步位移全部安全）。",
+                res.ActiveWaypointCount, res.PlannedSegmentCountPerCycle), UiTheme.Success);
         }
 
         private void RefreshUi()
@@ -448,6 +712,7 @@ namespace ScaraArm.Console
             UpdateModeBar(hasLiveCounts, commOk, st);
             UpdateAxisCards(connected, hasLiveCounts, liveJoints, st);
             UpdateCartesianPanel(commOk, pdoFresh, hasLiveCounts, st);
+            UpdateTeachTaskPanel(commOk, pdoFresh, hasLiveCounts, st);
             UpdateJointPanel(connected, commOk, pdoFresh, pdoStale, st);
 
             if (sessionLost)
@@ -528,24 +793,36 @@ namespace ScaraArm.Console
 
         private void UpdateModeBar(bool hasLiveCounts, bool commOk, Sc4iStatusReply st)
         {
-            jointModeButton.BackColor = !cartesianMode ? UiTheme.Accent : UiTheme.CardBg;
-            jointModeButton.ForeColor = !cartesianMode ? Color.White : UiTheme.Ink;
-            jointModeButton.FlatAppearance.BorderSize = !cartesianMode ? 0 : 1;
-            cartModeButton.BackColor = cartesianMode ? UiTheme.Accent : UiTheme.CardBg;
-            cartModeButton.ForeColor = cartesianMode ? Color.White : UiTheme.Ink;
-            cartModeButton.FlatAppearance.BorderSize = cartesianMode ? 0 : 1;
-            jointModeButton.Enabled = !jogActive;
-            cartModeButton.Enabled = !jogActive;
-            setZeroButton.Enabled = hasLiveCounts && commOk && !busy && !jogActive && st != null && st.MotionState == 0;
+            bool isJoint = controlMode == ConsoleControlMode.Joint;
+            bool isCart = controlMode == ConsoleControlMode.Cartesian;
+            bool isTeach = controlMode == ConsoleControlMode.TeachTask;
+            bool canSwitchMode = !jogActive && !taskRunning;
+
+            jointModeButton.BackColor = isJoint ? UiTheme.Accent : UiTheme.CardBg;
+            jointModeButton.ForeColor = isJoint ? Color.White : UiTheme.Ink;
+            jointModeButton.FlatAppearance.BorderSize = isJoint ? 0 : 1;
+
+            cartModeButton.BackColor = isCart ? UiTheme.Accent : UiTheme.CardBg;
+            cartModeButton.ForeColor = isCart ? Color.White : UiTheme.Ink;
+            cartModeButton.FlatAppearance.BorderSize = isCart ? 0 : 1;
+
+            teachModeButton.BackColor = isTeach ? UiTheme.Accent : UiTheme.CardBg;
+            teachModeButton.ForeColor = isTeach ? Color.White : UiTheme.Ink;
+            teachModeButton.FlatAppearance.BorderSize = isTeach ? 0 : 1;
+
+            jointModeButton.Enabled = canSwitchMode;
+            cartModeButton.Enabled = canSwitchMode;
+            teachModeButton.Enabled = canSwitchMode;
+            setZeroButton.Enabled = hasLiveCounts && commOk && !busy && !jogActive && !taskRunning && st != null && st.MotionState == 0;
             setZeroButton.ForeColor = setZeroButton.Enabled ? UiTheme.Ink : UiTheme.Muted;
-            calDialogButton.Enabled = !busy && !jogActive;
+            calDialogButton.Enabled = !busy && !jogActive && !taskRunning;
         }
 
         private void UpdateAxisCards(bool connected, bool hasLiveCounts, ScaraJointPose liveJoints, Sc4iStatusReply st)
         {
             for (int i = 0; i < 4; i++)
             {
-                bool isSelected = !cartesianMode && selectedAxis == i;
+                bool isSelected = controlMode == ConsoleControlMode.Joint && selectedAxis == i;
                 Sc4iSlaveTelemetry sl = (st != null && st.Slaves != null && i < st.Slaves.Length) ? st.Slaves[i] : null;
                 bool en = st != null && st.IsAxisEnabled(i);
                 bool auth = st != null && st.IsAxisAuthorized(i);
@@ -608,6 +885,43 @@ namespace ScaraArm.Console
                 AllAxesReady = allAxesReady,
                 CanMove = canEnableAll && hasLiveCounts,
                 CanFillCurrent = hasLiveCounts && !busy
+            });
+        }
+
+        private void UpdateTeachTaskPanel(bool commOk, bool pdoFresh, bool hasLiveCounts, Sc4iStatusReply st)
+        {
+            bool anySlaveFault = false;
+            bool allAxesReady = hasLiveCounts;
+            for (int i = 0; i < 4; i++)
+            {
+                Sc4iSlaveTelemetry s = (st != null && st.Slaves != null && i < st.Slaves.Length) ? st.Slaves[i] : null;
+                if (s != null && s.IsFault) anySlaveFault = true;
+                if (st == null || !st.IsAxisEnabled(i) || !st.IsAxisAuthorized(i)) allAxesReady = false;
+            }
+
+            bool canEnableAll = commOk && pdoFresh && !busy && !jogActive && !taskRunning && !anySlaveFault
+                && st != null && st.LatchedFault == 0 && st.EstopFlag == 0 && st.MotionState == 0;
+
+            string summary = taskRunning && !String.IsNullOrEmpty(activeTaskProgressText)
+                ? activeTaskProgressText
+                : String.Format(
+                    CultureInfo.InvariantCulture,
+                    "共 {0} 点（启用 {1}）· {2}",
+                    teachProgram.Waypoints.Count,
+                    teachProgram.CountEnabledWaypoints(),
+                    teachProgram.RepeatCycles == 0 ? "无限循环" : (teachProgram.RepeatCycles + " 轮"));
+
+            teachPanel.UpdateView(new TeachTaskViewState
+            {
+                CanEnableAll = canEnableAll,
+                AllAxesReady = allAxesReady,
+                CanTeachCurrent = hasLiveCounts && !busy && !jogActive && !taskRunning,
+                CanEditProgram = !busy && !jogActive && !taskRunning,
+                CanRunTask = canEnableAll && hasLiveCounts,
+                CanValidate = commOk && pdoFresh && hasLiveCounts && !busy && !jogActive && !taskRunning,
+                TaskRunning = taskRunning,
+                ActiveWaypointIndex = taskRunning ? activeTaskWaypointIndex : -1,
+                ProgressSummary = summary
             });
         }
 

@@ -203,6 +203,9 @@ namespace ScaraArm.Tests
             uint pdoAgeMs = 0;
             uint validMaskOverride = 0x1Fu;
             int dropRepliesCount = 0;
+            int dropNextPtpRequestCount = 0;
+            int dropNextPtpReplyOnlyCount = 0;
+            int ptpExecutedCount = 0;
             int[] positions = { 262144, 0, 0, 0 };
             ushort[] statusWords = { 0x1627, 0x1650, 0x1650, 0x1650 };
             ushort[] driveErrors = { 0, 0, 0, 0 };
@@ -283,8 +286,27 @@ namespace ScaraArm.Tests
                             }
                             else
                             {
+                                if (sub == Sc4iSubcmd.MoveAxisPtp && dropNextPtpRequestCount > 0)
+                                {
+                                    dropNextPtpRequestCount--;
+                                    continue;
+                                }
                                 if (seq <= lastAcceptedSeq) err = 0x35u;
-                                else lastAcceptedSeq = seq;
+                                else
+                                {
+                                    lastAcceptedSeq = seq;
+                                    if (sub == Sc4iSubcmd.MoveAxisPtp)
+                                    {
+                                        ptpExecutedCount++;
+                                        double tgt = BitConverter.ToDouble(pkt, 40);
+                                        positions[pkt[9]] = (int)Math.Round(tgt * 262144.0);
+                                        if (dropNextPtpReplyOnlyCount > 0)
+                                        {
+                                            dropNextPtpReplyOnlyCount--;
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
 
                             byte[] staleF2 = Sc4iTestFrames.BuildStatusReply(
@@ -369,6 +391,21 @@ namespace ScaraArm.Tests
                 Sc4iStatusReply recoveredJog = await client.SendJogKeepaliveAsync(CancellationToken.None).ConfigureAwait(false);
                 t.Check(recoveredJog.ErrorCode == 0u && dropRepliesCount == 0,
                     "JogKeepalive recovered from 1 dropped UDP packet");
+
+                // MoveAxisPtp dropped request -> same-seq retry succeeds once
+                ptpExecutedCount = 0;
+                dropNextPtpRequestCount = 1;
+                Sc4iStatusReply ptpReqRecovered = await client.MoveAxisToTargetRevAsync(0, 1.5, 0.5, 1.0, CancellationToken.None).ConfigureAwait(false);
+                t.Check(ptpReqRecovered.ErrorCode == 0u && ptpExecutedCount == 1 && dropNextPtpRequestCount == 0,
+                    "MoveAxisPtp recovered from dropped request via same-seq retry without duplicate execution");
+
+                // MoveAxisPtp reply lost after execution -> same-seq retry sees 0x35 and confirms via Heartbeat without re-executing
+                ptpExecutedCount = 0;
+                dropNextPtpReplyOnlyCount = 1;
+                Sc4iStatusReply ptpRepRecovered = await client.MoveAxisToTargetRevAsync(0, 1.8, 0.5, 1.0, CancellationToken.None).ConfigureAwait(false);
+                t.Check(ptpRepRecovered.ErrorCode == 0u && ptpExecutedCount == 1 && dropNextPtpReplyOnlyCount == 0
+                    && Math.Abs(ptpRepRecovered.Slaves[0].ActualRevolutions(client.CountsPerRevolution) - 1.8) < 1e-4,
+                    "MoveAxisPtp recovered from lost reply via 0x35 replay detection and Heartbeat confirmation");
 
                 dropRepliesCount = 10;
                 Task<Sc4iStatusReply> stalled = client.SendHeartbeatAsync(CancellationToken.None);

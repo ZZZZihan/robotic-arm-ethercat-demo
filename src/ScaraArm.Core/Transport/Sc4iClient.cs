@@ -318,7 +318,7 @@ namespace ScaraArm.Core.Transport
                     throw new ArgumentOutOfRangeException("targetRev", "单轴目标位移 " + deltaRev.ToString("0.###") + " 圈超过安全上限 ±" + MaxSafeStepRev + " 圈。");
 
                 byte[] payload = Sc4iProtocol.BuildMoveAxisPtpPayload(targetRev, velRevPerSec, accRevPerSec2);
-                Sc4iStatusReply reply = SendNextF2(Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 3000, ct);
+                Sc4iStatusReply reply = SendMoveAxisPtpSameSeqWithRetry((byte)jointIndex, payload, 1500, ct);
                 if (reply.ErrorCode != 0)
                     throw new Sc4iCommandException("轴 " + (jointIndex + 1) + " 绝对定位", reply);
                 return Task.FromResult(reply);
@@ -339,7 +339,7 @@ namespace ScaraArm.Core.Transport
                 double currentRev = status.Slaves[jointIndex].ActualRevolutions(CountsPerRevolution);
                 double targetRev = currentRev + deltaRev;
                 byte[] payload = Sc4iProtocol.BuildMoveAxisPtpPayload(targetRev, velRevPerSec, accRevPerSec2);
-                Sc4iStatusReply reply = SendNextF2(Sc4iSubcmd.MoveAxisPtp, (byte)jointIndex, payload, 3000, ct);
+                Sc4iStatusReply reply = SendMoveAxisPtpSameSeqWithRetry((byte)jointIndex, payload, 1500, ct);
                 if (reply.ErrorCode != 0)
                     throw new Sc4iCommandException("轴 " + (jointIndex + 1) + " 相对定位", reply);
                 return Task.FromResult(reply);
@@ -480,15 +480,62 @@ namespace ScaraArm.Core.Transport
             throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。");
         }
 
+        private Sc4iStatusReply SendMoveAxisPtpSameSeqWithRetry(byte jointIndex, byte[] payload, int timeoutMs, CancellationToken ct)
+        {
+            // Retransmit the exact same seq on UDP loss so the firmware's replay guard (0x35)
+            // prevents duplicate execution while recovering promptly within the <1000 ms watchdog.
+            uint seq = nextSeq++;
+            if (seq == 0) seq = nextSeq++;
+            if (seq > maxUsedSeq) maxUsedSeq = seq;
+
+            const int maxAttempts = 4;
+            const int perAttemptTimeoutMs = 180;
+            Stopwatch overall = Stopwatch.StartNew();
+            TimeoutException lastTimeout = null;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                int remaining = timeoutMs - (int)overall.ElapsedMilliseconds;
+                if (remaining <= 0) break;
+                int attemptTimeout = Math.Min(perAttemptTimeoutMs, remaining);
+                if (attemptTimeout < 30 && attempt > 0) break;
+
+                try
+                {
+                    Sc4iStatusReply reply = SendF2OnChannel(
+                        channel, Sc4iSubcmd.MoveAxisPtp, jointIndex, seq, bootId, sessionId, payload, attemptTimeout, ct);
+                    if (attempt > 0 && reply.ErrorCode == 0x35u)
+                    {
+                        // The first packet was accepted by the card and only its reply was lost.
+                        // Fetch fresh live status via Heartbeat so callers observe actual motion/safety state.
+                        return SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
+                    }
+                    lock (stateLock)
+                    {
+                        lastStatus = reply;
+                    }
+                    return reply;
+                }
+                catch (TimeoutException ex)
+                {
+                    lastTimeout = ex;
+                    if (attempt + 1 >= maxAttempts || ct.IsCancellationRequested)
+                        throw;
+                }
+            }
+
+            throw lastTimeout ?? new TimeoutException("等待控制卡应答超时（" + timeoutMs + " ms）。");
+        }
+
         private static void GetRetryPolicy(Sc4iSubcmd subcmd, int overallTimeoutMs, out int perAttemptTimeoutMs, out int maxAttempts)
         {
-            // Only idempotent keepalive/read/stop subcommands may fast-retry on single UDP packet loss;
-            // motion/enable/config commands remain single-shot to prevent duplicate execution.
+            // Idempotent keepalive/read/stop/enable/reset subcommands fast-retry on transient UDP EMI packet loss;
+            // non-idempotent config/bus-init commands remain single-shot.
             switch (subcmd)
             {
                 case Sc4iSubcmd.Heartbeat:
                     perAttemptTimeoutMs = Math.Min(120, overallTimeoutMs);
-                    maxAttempts = 4;
+                    maxAttempts = 6;
                     return;
                 case Sc4iSubcmd.JogKeepalive:
                     perAttemptTimeoutMs = Math.Min(70, overallTimeoutMs);
@@ -501,6 +548,11 @@ namespace ScaraArm.Core.Transport
                 case Sc4iSubcmd.Snapshot:
                     perAttemptTimeoutMs = Math.Min(150, overallTimeoutMs);
                     maxAttempts = 3;
+                    return;
+                case Sc4iSubcmd.EnableAxes:
+                case Sc4iSubcmd.FaultReset:
+                    perAttemptTimeoutMs = Math.Min(250, overallTimeoutMs);
+                    maxAttempts = 4;
                     return;
                 default:
                     perAttemptTimeoutMs = overallTimeoutMs;
