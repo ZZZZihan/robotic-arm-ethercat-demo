@@ -78,6 +78,7 @@ namespace ScaraArm.Console
         private int heartbeatFailCount;
         private bool sessionLost;
         private bool formClosing;
+        private bool skipCloseConfirm;
         private Sc4iStatusReply liveStatus;
         private CancellationTokenSource activeOpCts;
         private CancellationTokenSource pollCts;
@@ -146,6 +147,7 @@ namespace ScaraArm.Console
 
         internal void StopTimersForDiagnostics()
         {
+            skipCloseConfirm = true;
             pollTimer.Stop();
             jogTimer.Stop();
         }
@@ -215,7 +217,7 @@ namespace ScaraArm.Console
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58));
 
@@ -701,9 +703,10 @@ namespace ScaraArm.Console
             bool busReady = connected && st != null && st.BusReady;
             bool pdoFresh = connected && st != null && st.IsPdoFresh(Sc4iClient.MaxFreshPdoAgeMs);
             bool pdoStale = busReady && !pdoFresh;
+            bool holdProtectionOnly = commOk && !pdoStale && st != null && st.IsHeartbeatHoldProtectionOnly();
             bool hasFault = sessionLost || heartbeatFailCount > 0 || (st != null && (st.LatchedFault != 0 || st.EstopFlag != 0 || pdoStale));
 
-            UpdateTopBar(connected, busReady, commOk, pdoStale, hasFault, st);
+            UpdateTopBar(connected, busReady, commOk, pdoStale, hasFault, holdProtectionOnly, st);
 
             int[] liveCounts = null;
             bool hasLiveCounts = st != null && st.TryExtractLiveCounts(out liveCounts);
@@ -713,24 +716,31 @@ namespace ScaraArm.Console
             UpdateAxisCards(connected, hasLiveCounts, liveJoints, st);
             UpdateCartesianPanel(commOk, pdoFresh, hasLiveCounts, st);
             UpdateTeachTaskPanel(commOk, pdoFresh, hasLiveCounts, st);
-            UpdateJointPanel(connected, commOk, pdoFresh, pdoStale, st);
+            UpdateJointPanel(connected, commOk, pdoFresh, pdoStale, holdProtectionOnly, st);
 
             if (sessionLost)
                 SetStatus("会话已失效或控制卡已重启，请点击“断开”后重新连接。", UiTheme.Danger);
             else if (pdoStale)
                 SetStatus("总线通信中断，已锁定运动，请检查网线或驱动器。", UiTheme.Danger);
+            else if (holdProtectionOnly)
+                SetStatus("上次断开已进入安全持力保护 (0x30)，四轴驱动器正常；确认安全后点击“恢复持力”继续。", UiTheme.Warning);
             else if (st != null && st.LatchedFault != 0)
                 SetStatus("故障锁存：" + Sc4iProtocol.FormatErrorCode(st.LatchedFault) + "，确认安全后点击“清故障”。", UiTheme.Danger);
             else if (st != null && st.EstopFlag != 0)
                 SetStatus("急停已锁存，确认安全后点击“清故障”。", UiTheme.Danger);
         }
 
-        private void UpdateTopBar(bool connected, bool busReady, bool commOk, bool pdoStale, bool hasFault, Sc4iStatusReply st)
+        private void UpdateTopBar(bool connected, bool busReady, bool commOk, bool pdoStale, bool hasFault, bool holdProtectionOnly, Sc4iStatusReply st)
         {
             if (!connected)
             {
                 connectionBadge.Text = busy ? "● 连接中…" : "● 未连接";
                 connectionBadge.ForeColor = busy ? UiTheme.Accent : UiTheme.Muted;
+            }
+            else if (holdProtectionOnly)
+            {
+                connectionBadge.Text = "● 安全持力保护";
+                connectionBadge.ForeColor = UiTheme.Warning;
             }
             else if (hasFault)
             {
@@ -757,7 +767,20 @@ namespace ScaraArm.Console
             connectButton.ForeColor = !busy ? Color.White : UiTheme.Muted;
 
             clearFaultButton.Enabled = commOk && !busy && !jogActive && busReady;
-            clearFaultButton.ForeColor = clearFaultButton.Enabled ? (hasFault ? UiTheme.Danger : UiTheme.Ink) : UiTheme.Muted;
+            if (holdProtectionOnly)
+            {
+                clearFaultButton.Text = "恢复持力";
+                clearFaultButton.BackColor = clearFaultButton.Enabled ? UiTheme.Warning : UiTheme.DisabledBg;
+                clearFaultButton.ForeColor = clearFaultButton.Enabled ? Color.White : UiTheme.Muted;
+                clearFaultButton.FlatAppearance.BorderSize = clearFaultButton.Enabled ? 0 : 1;
+            }
+            else
+            {
+                clearFaultButton.Text = "清故障";
+                clearFaultButton.BackColor = UiTheme.CardBg;
+                clearFaultButton.ForeColor = clearFaultButton.Enabled ? (hasFault ? UiTheme.Danger : UiTheme.Ink) : UiTheme.Muted;
+                clearFaultButton.FlatAppearance.BorderSize = 1;
+            }
 
             estopButton.Enabled = connected;
             estopButton.BackColor = connected ? UiTheme.Danger : UiTheme.DisabledBg;
@@ -925,7 +948,7 @@ namespace ScaraArm.Console
             });
         }
 
-        private void UpdateJointPanel(bool connected, bool commOk, bool pdoFresh, bool pdoStale, Sc4iStatusReply st)
+        private void UpdateJointPanel(bool connected, bool commOk, bool pdoFresh, bool pdoStale, bool holdProtectionOnly, Sc4iStatusReply st)
         {
             Sc4iSlaveTelemetry selSlave = (st != null && st.Slaves != null && selectedAxis < st.Slaves.Length) ? st.Slaves[selectedAxis] : null;
             bool selEnabled = st != null && st.IsAxisEnabled(selectedAxis);
@@ -939,6 +962,7 @@ namespace ScaraArm.Console
                 : sessionLost ? "会话已失效，请重新连接"
                 : heartbeatFailCount > 0 ? "通信超时，等待恢复"
                 : pdoStale ? "总线异常"
+                : holdProtectionOnly ? "安全持力保护，点“恢复持力”继续"
                 : (st != null && (st.LatchedFault != 0 || st.EstopFlag != 0)) ? "停机锁存，请先清故障"
                 : selFault ? "驱动报警，请先清故障"
                 : selEnabling ? "使能中…"

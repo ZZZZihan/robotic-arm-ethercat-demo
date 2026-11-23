@@ -17,8 +17,27 @@ namespace ScaraArm.Console
     /// </summary>
     internal sealed partial class MainForm
     {
+        private bool ConfirmDisconnectWhileEnabled(string actionTitle)
+        {
+            if (!sc4iClient.IsConnected || liveStatus == null || liveStatus.EnabledMask == 0 || sessionLost)
+                return true;
+
+            DialogResult ans = MessageBox.Show(
+                this,
+                "当前仍有轴处于使能持力状态。\n断开后控制卡将在 1 秒后自动进入安全持力保护（0x30）以防 Z 轴下坠，下次重连点击“恢复持力”即可继续。\n\n确认继续？",
+                actionTitle,
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information);
+            return ans == DialogResult.Yes;
+        }
+
         private void OnMainFormClosing(object sender, FormClosingEventArgs e)
         {
+            if (!skipCloseConfirm && e.CloseReason != CloseReason.WindowsShutDown && !ConfirmDisconnectWhileEnabled("确认关闭控制台"))
+            {
+                e.Cancel = true;
+                return;
+            }
             formClosing = true;
             pollTimer.Stop();
             jogTimer.Stop();
@@ -46,6 +65,7 @@ namespace ScaraArm.Console
             if (busy) return;
             if (sc4iClient.IsConnected)
             {
+                if (!ConfirmDisconnectWhileEnabled("确认断开控制卡")) return;
                 await DisconnectAsync();
                 return;
             }
@@ -71,10 +91,13 @@ namespace ScaraArm.Console
                 heartbeatFailCount = 0;
                 sessionLost = false;
                 pollTimer.Start();
-                string readyMsg = liveStatus.EnabledMask == 0
-                    ? "已连接，总线就绪（电机未使能）。"
-                    : "已连接，总线就绪（已有轴处于使能/持力状态）。";
-                SetStatus(readyMsg, UiTheme.Success);
+                bool holdOnly = liveStatus.IsHeartbeatHoldProtectionOnly();
+                string readyMsg = holdOnly
+                    ? "上次断开已进入安全持力保护 (0x30)，四轴驱动器正常；确认安全后点击“恢复持力”继续。"
+                    : liveStatus.EnabledMask == 0
+                        ? "已连接，总线就绪（电机未使能）。"
+                        : "已连接，总线就绪（已有轴处于使能/持力状态）。";
+                SetStatus(readyMsg, holdOnly ? UiTheme.Warning : UiTheme.Success);
             }
             catch (Exception error)
             {
@@ -268,6 +291,22 @@ namespace ScaraArm.Console
 
         private Task ClearFaultsAsync()
         {
+            if (liveStatus != null && liveStatus.IsHeartbeatHoldProtectionOnly())
+            {
+                byte mask = (byte)(liveStatus.EnabledMask & 0x0F);
+                return RunExclusiveCommandAsync(
+                    "正在解除安全持力保护并恢复授权…",
+                    5000,
+                    ct => sc4iClient.RecoverHoldProtectionAndAuthorizeAsync(mask, ct),
+                    reply =>
+                    {
+                        FillTargetFromCurrentIfConnected();
+                        SetStatus("安全持力保护已解除，授权已恢复。", UiTheme.Success);
+                    },
+                    "恢复持力超时。",
+                    "恢复持力失败：");
+            }
+
             return RunExclusiveCommandAsync(
                 "正在清除故障与停机锁存…",
                 5000,

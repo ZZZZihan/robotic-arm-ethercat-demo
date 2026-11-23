@@ -17,6 +17,8 @@ namespace ScaraArm.Console.Theme
         public static readonly Color BorderColor = Color.FromArgb(221, 227, 234);
         public static readonly Color Accent = Color.FromArgb(22, 119, 255);
         public static readonly Color Success = Color.FromArgb(22, 148, 82);
+        public static readonly Color Warning = Color.FromArgb(194, 120, 3);
+        public static readonly Color WarningBg = Color.FromArgb(254, 249, 195);
         public static readonly Color Danger = Color.FromArgb(214, 48, 49);
         public static readonly Color Ink = Color.FromArgb(30, 41, 59);
         public static readonly Color Muted = Color.FromArgb(100, 116, 139);

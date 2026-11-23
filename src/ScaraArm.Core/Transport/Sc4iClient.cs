@@ -397,6 +397,45 @@ namespace ScaraArm.Core.Transport
             });
         }
 
+        public Task<Sc4iStatusReply> RecoverHoldProtectionAndAuthorizeAsync(byte authorizeMask, CancellationToken cancellationToken)
+        {
+            return RunConnectedAsync(cancellationToken, async ct =>
+            {
+                Sc4iStatusReply status = SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);
+                if (status.ErrorCode != 0)
+                    throw new Sc4iCommandException("查询安全持力状态", status);
+                if (status.EstopFlag != 0)
+                    throw new InvalidOperationException("检测到急停标志，不能自动解除持力保护，请先确认现场并执行“清故障”。");
+                if (!status.PdoOk)
+                    throw new InvalidOperationException("EtherCAT PDO 状态异常，不能解除持力保护。");
+                if (status.HasAnyDriveFault())
+                    throw new InvalidOperationException("检测到伺服驱动器报警，请使用“清故障”排查并复位驱动器。");
+                if (status.LatchedFault != 0 && status.LatchedFault != 0x30u)
+                    throw new InvalidOperationException("存在非心跳超时的故障锁存（" + Sc4iProtocol.FormatErrorCode(status.LatchedFault) + "），请先手动清故障。");
+
+                Sc4iStatusReply current = status;
+                if (current.LatchedFault == 0x30u)
+                {
+                    Sc4iStatusReply cleared = SendNextF2(Sc4iSubcmd.FaultReset, 0, null, 3000, ct);
+                    if (cleared.ErrorCode != 0)
+                        throw new Sc4iCommandException("解除心跳安全持力保护", cleared);
+                    current = cleared;
+                    await Task.Delay(60, ct).ConfigureAwait(false);
+                }
+
+                byte effectiveMask = authorizeMask != 0
+                    ? (byte)(authorizeMask & 0x0F)
+                    : (byte)(current.EnabledMask & 0x0F);
+                if (effectiveMask == 0)
+                    return current;
+
+                Sc4iStatusReply authorized = SendNextF2(Sc4iSubcmd.EnableAxes, effectiveMask, null, 4000, ct);
+                if (authorized.ErrorCode != 0)
+                    throw new Sc4iCommandException("恢复轴授权", authorized);
+                return authorized;
+            });
+        }
+
         private Sc4iStatusReply CheckPreMotionSafety(int jointIndex, CancellationToken ct)
         {
             Sc4iStatusReply status = SendNextF2(Sc4iSubcmd.Heartbeat, 0, null, defaultTimeoutMs, ct);

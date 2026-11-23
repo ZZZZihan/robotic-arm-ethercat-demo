@@ -29,6 +29,7 @@ namespace ScaraArm.Tests
             uint enabledMask = 0;
             uint authMask = 0;
             uint latchedFault = 0;
+            byte estopFlag = 0;
             int[] positions = { 262144, -524288, 0, 131072 };
             ushort[] statusWords = { 0x1650, 0x1650, 0x1650, 0x1650 };
             ushort[] driveErrors = { 0, 0, 0, 0 };
@@ -123,7 +124,7 @@ namespace ScaraArm.Tests
                             }
 
                             byte[] rep = Sc4iTestFrames.BuildStatusReply(
-                                sub, 0, 0, slaveCount, seq, bootId, boundSid, err, latchedFault,
+                                sub, 0, estopFlag, slaveCount, seq, bootId, boundSid, err, latchedFault,
                                 busReady, cfgLoaded, enabledMask, authMask, 0u, 255u, busReady, 0u,
                                 busReady ? 100u : 0u, busReady ? 100u : 0u, busReady ? 52u : 0u,
                                 positions, statusWords, driveErrors);
@@ -167,6 +168,34 @@ namespace ScaraArm.Tests
                 latchedFault = 0x2Du;
                 st = await client.ClearFaultsAndLatchAsync(CancellationToken.None).ConfigureAwait(false);
                 t.Check(faultResetMaskCalls == 1 && faultResetLatchCalls == 1 && st.LatchedFault == 0u, "2-step fault reset cleared drive and controller latch");
+
+                // Simulate pure 0x30 heartbeat hold protection -> one-step clear + authorize
+                authMask = 0u;
+                statusWords[0] = 0x1617;
+                latchedFault = 0x30u;
+                st = await client.RecoverHoldProtectionAndAuthorizeAsync(0, CancellationToken.None).ConfigureAwait(false);
+                t.Check(st.LatchedFault == 0u && st.AuthorizedMask == 1u && st.EnabledMask == 1u && faultResetLatchCalls == 2,
+                    "RecoverHoldProtectionAndAuthorizeAsync cleared 0x30 and re-authorized held axes");
+
+                // Reject one-step recovery if a drive alarm or non-0x30 latch is present
+                driveErrors[1] = 0x2310;
+                statusWords[1] = 0x1658;
+                latchedFault = 0x30u;
+                t.Throws<InvalidOperationException>(() =>
+                    client.RecoverHoldProtectionAndAuthorizeAsync(0x0F, CancellationToken.None).GetAwaiter().GetResult(),
+                    "RecoverHoldProtectionAndAuthorizeAsync rejects when a drive alarm exists");
+                driveErrors[1] = 0;
+                statusWords[1] = 0x1650;
+                latchedFault = 0x2Fu;
+                t.Throws<InvalidOperationException>(() =>
+                    client.RecoverHoldProtectionAndAuthorizeAsync(0x0F, CancellationToken.None).GetAwaiter().GetResult(),
+                    "RecoverHoldProtectionAndAuthorizeAsync rejects non-0x30 latched fault");
+                latchedFault = 0;
+                estopFlag = 1;
+                t.Throws<InvalidOperationException>(() =>
+                    client.RecoverHoldProtectionAndAuthorizeAsync(0x0F, CancellationToken.None).GetAwaiter().GetResult(),
+                    "RecoverHoldProtectionAndAuthorizeAsync rejects when E-Stop flag is active");
+                estopFlag = 0;
 
                 client.Disconnect();
                 t.Check(!client.IsConnected, "Disconnected cleanly");
