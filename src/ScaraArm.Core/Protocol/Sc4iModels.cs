@@ -185,5 +185,26 @@ namespace ScaraArm.Core.Protocol
             }
             return mask;
         }
+
+        public bool HasAnyDriveFault()
+        {
+            if (Slaves == null) return false;
+            for (int i = 0; i < Slaves.Length && i < 4; i++)
+            {
+                if (Slaves[i] != null && Slaves[i].IsFault)
+                    return true;
+            }
+            return false;
+        }
+
+        public bool IsHeartbeatHoldProtectionOnly()
+        {
+            return BusReady
+                && PdoOk
+                && EstopFlag == 0
+                && LatchedFault == 0x30u
+                && !HasAnyDriveFault()
+                && EnabledMask != 0;
+        }
     }
 }

@@ -56,6 +56,54 @@ namespace ScaraArm.Tests
             t.Check(!st.Slaves[0].IsFault && !st.Slaves[0].IsOperationEnabled && st.Slaves[0].ValidMask == 0x1Fu, "Slave 0 flags");
             t.Check(Sc4iProtocol.FormatErrorCode(0x30u).Contains("心跳"), "FormatErrorCode(0x30) describes heartbeat timeout");
             t.Check(Sc4iProtocol.FormatErrorCode(0x2Eu).Contains("CSP"), "FormatErrorCode(0x2E) describes CSP mismatch");
+
+            // Heartbeat hold-protection detection (0x30 with healthy drives & enabled torque)
+            byte[] holdOnlyRaw = Sc4iTestFrames.BuildStatusReply(
+                Sc4iSubcmd.Snapshot, 0, 0, 4, 101u, 0x36BF0DE8485C3E0Eul, 0x2026112100000010ul,
+                0u, 0x30u, true, true, 0x0Fu, 0u, 0u, 255u, true, 0u, 500u, 500u, 52u,
+                new int[] { 0, 0, 0, 0 },
+                new ushort[] { 0x1617, 0x1617, 0x1617, 0x1617 },
+                new ushort[] { 0, 0, 0, 0 });
+            Sc4iStatusReply holdOnly = Sc4iProtocol.ParseF2Reply(holdOnlyRaw);
+            t.Check(!holdOnly.HasAnyDriveFault() && holdOnly.IsHeartbeatHoldProtectionOnly(),
+                "Pure 0x30 hold protection with healthy drives is detected");
+
+            byte[] holdWithDriveAlarm = Sc4iTestFrames.BuildStatusReply(
+                Sc4iSubcmd.Snapshot, 0, 0, 4, 102u, 0x36BF0DE8485C3E0Eul, 0x2026112100000010ul,
+                0u, 0x30u, true, true, 0x0Fu, 0u, 0u, 1u, true, 0u, 500u, 500u, 52u,
+                new int[] { 0, 0, 0, 0 },
+                new ushort[] { 0x1617, 0x1658, 0x1617, 0x1617 },
+                new ushort[] { 0, 0x0E08, 0, 0 });
+            Sc4iStatusReply drvAlarmSt = Sc4iProtocol.ParseF2Reply(holdWithDriveAlarm);
+            t.Check(drvAlarmSt.HasAnyDriveFault() && !drvAlarmSt.IsHeartbeatHoldProtectionOnly(),
+                "0x30 combined with drive alarm is NOT hold-protection-only");
+
+            byte[] holdWithEstop = Sc4iTestFrames.BuildStatusReply(
+                Sc4iSubcmd.Snapshot, 0, 1, 4, 103u, 0x36BF0DE8485C3E0Eul, 0x2026112100000010ul,
+                0u, 0x30u, true, true, 0x0Fu, 0u, 0u, 255u, true, 0u, 500u, 500u, 52u,
+                new int[] { 0, 0, 0, 0 },
+                new ushort[] { 0x1617, 0x1617, 0x1617, 0x1617 },
+                new ushort[] { 0, 0, 0, 0 });
+            t.Check(!Sc4iProtocol.ParseF2Reply(holdWithEstop).IsHeartbeatHoldProtectionOnly(),
+                "E-Stop flag excludes hold-protection-only classification");
+
+            byte[] non30Latch = Sc4iTestFrames.BuildStatusReply(
+                Sc4iSubcmd.Snapshot, 0, 0, 4, 104u, 0x36BF0DE8485C3E0Eul, 0x2026112100000010ul,
+                0u, 0x2Fu, true, true, 0x0Fu, 0u, 0u, 255u, true, 0u, 500u, 500u, 52u,
+                new int[] { 0, 0, 0, 0 },
+                new ushort[] { 0x1617, 0x1617, 0x1617, 0x1617 },
+                new ushort[] { 0, 0, 0, 0 });
+            t.Check(!Sc4iProtocol.ParseF2Reply(non30Latch).IsHeartbeatHoldProtectionOnly(),
+                "Non-0x30 latch (0x2F) excludes hold-protection-only classification");
+
+            byte[] zeroEnable = Sc4iTestFrames.BuildStatusReply(
+                Sc4iSubcmd.Snapshot, 0, 0, 4, 105u, 0x36BF0DE8485C3E0Eul, 0x2026112100000010ul,
+                0u, 0x30u, true, true, 0u, 0u, 0u, 255u, true, 0u, 500u, 500u, 52u,
+                new int[] { 0, 0, 0, 0 },
+                new ushort[] { 0x1650, 0x1650, 0x1650, 0x1650 },
+                new ushort[] { 0, 0, 0, 0 });
+            t.Check(!Sc4iProtocol.ParseF2Reply(zeroEnable).IsHeartbeatHoldProtectionOnly(),
+                "EnabledMask=0 excludes hold-protection-only classification");
         }
 
         private static void ConfigTests(TestRunner t)
